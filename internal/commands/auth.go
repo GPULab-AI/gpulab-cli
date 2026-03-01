@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/gpulab/gpulab-cli/internal/api"
-	"github.com/gpulab/gpulab-cli/internal/config"
-	"github.com/gpulab/gpulab-cli/internal/output"
+	"github.com/GPULab-AI/gpulab-cli/internal/api"
+	"github.com/GPULab-AI/gpulab-cli/internal/config"
+	"github.com/GPULab-AI/gpulab-cli/internal/output"
 	"github.com/spf13/cobra"
 )
 

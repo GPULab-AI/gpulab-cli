@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/gpulab/gpulab-cli/internal/commands"
+	"github.com/GPULab-AI/gpulab-cli/internal/commands"
 )
 
 var (

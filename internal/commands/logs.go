@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gpulab/gpulab-cli/internal/output"
+	"github.com/GPULab-AI/gpulab-cli/internal/output"
 	"github.com/spf13/cobra"
 )
 

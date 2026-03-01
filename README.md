@@ -9,10 +9,10 @@ Command-line interface for [GPULab](https://gpulab.ai) — deploy, manage, and i
 curl -fsSL https://gpulab.ai/cli.sh | sh
 
 # Or build from source
-go install github.com/gpulab/gpulab-cli/cmd/gpulab@latest
+go install github.com/GPULab-AI/gpulab-cli/cmd/gpulab@latest
 
 # Or clone and build
-git clone https://github.com/gpulab/gpulab-cli.git
+git clone https://github.com/GPULab-AI/gpulab-cli.git
 cd gpulab-cli
 make install
 ```

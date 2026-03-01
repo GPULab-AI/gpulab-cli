@@ -3,8 +3,8 @@ package commands
 import (
 	"fmt"
 
-	"github.com/gpulab/gpulab-cli/internal/output"
-	"github.com/gpulab/gpulab-cli/internal/terminal"
+	"github.com/GPULab-AI/gpulab-cli/internal/output"
+	"github.com/GPULab-AI/gpulab-cli/internal/terminal"
 	"github.com/spf13/cobra"
 )
 

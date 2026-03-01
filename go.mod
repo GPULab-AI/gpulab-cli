@@ -1,4 +1,4 @@
-module github.com/gpulab/gpulab-cli
+module github.com/GPULab-AI/gpulab-cli
 
 go 1.23.0
 

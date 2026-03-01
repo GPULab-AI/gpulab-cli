@@ -4,7 +4,7 @@ set -e
 # GPULab CLI Installer
 # Usage: curl -fsSL https://gpulab.ai/cli.sh | sh
 
-REPO="gpulab/gpulab-cli"
+REPO="GPULab-AI/gpulab-cli"
 BINARY="gpulab"
 INSTALL_DIR="/usr/local/bin"
 
