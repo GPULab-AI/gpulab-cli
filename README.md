@@ -137,6 +137,40 @@ gpulab deploy \
   -- python train.py --epochs 100 --lr 0.001 --batch-size 32
 ```
 
+## Serverless GPUs
+
+Serverless endpoints use the same API key auth as containers.
+
+```bash
+# See available serverless templates, GPU types, regions, volumes, and policy templates
+gpulab serverless options
+
+# Create an endpoint
+gpulab serverless create \
+  --name llama-api \
+  --template pytorch \
+  --gpu-type "RTX 4090" \
+  --memory 32 \
+  --port 8000 \
+  --min-replicas 0 \
+  --max-replicas 2 \
+  --concurrency 1 \
+  -e HF_TOKEN \
+  --command "python app.py"
+
+# Inspect, invoke, and read logs/history
+gpulab serverless inspect llama-api
+gpulab serverless invoke llama-api /v1/chat/completions -d '{"prompt":"hello"}' --wait
+gpulab serverless requests llama-api
+gpulab serverless autoscaling-logs llama-api
+gpulab serverless logs llama-api --replica all
+gpulab serverless logs llama-api --deploy
+
+# Update or delete
+gpulab serverless update llama-api --max-replicas 4 --autoscaling-template pending_requests_linear
+gpulab serverless delete llama-api --force
+```
+
 ## Commands
 
 | Command | Description |
@@ -158,6 +192,11 @@ gpulab deploy \
 | `gpulab templates` | List templates |
 | `gpulab gpus types` | List GPU types |
 | `gpulab volumes` | List volumes |
+| `gpulab serverless` | Manage serverless GPU endpoints |
+| `gpulab serverless logs <endpoint>` | View serverless replica container logs |
+| `gpulab serverless requests <endpoint>` | View serverless request logs |
+| `gpulab serverless autoscaling-logs <endpoint>` | View autoscaling history |
+| `gpulab update` | Update the CLI from GitHub Releases |
 
 ## Global Flags
 
