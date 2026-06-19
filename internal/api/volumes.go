@@ -122,3 +122,33 @@ func (c *Client) GetVolume(id string) (*Volume, error) {
 	}
 	return &resp.Data, nil
 }
+
+// CreateVolumeRequest is the payload for provisioning a new network volume.
+type CreateVolumeRequest struct {
+	VolumeName  string `json:"volume_name"`
+	VolumeSpace int    `json:"volume_space"`
+	RegionID    string `json:"region_id,omitempty"`
+	VolumeType  string `json:"volume_type,omitempty"`
+	Description string `json:"description,omitempty"`
+	Notes       string `json:"notes,omitempty"`
+}
+
+func (c *Client) CreateVolume(req *CreateVolumeRequest) (*Volume, error) {
+	data, err := c.Post("/v1/volumes", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Data Volume `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse created volume: %w", err)
+	}
+	return &resp.Data, nil
+}
+
+func (c *Client) DeleteVolume(uuid string) error {
+	_, err := c.Delete("/v1/volumes/" + uuid)
+	return err
+}

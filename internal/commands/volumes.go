@@ -2,15 +2,39 @@ package commands
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/GPULab-AI/gpulab-cli/internal/api"
 	"github.com/GPULab-AI/gpulab-cli/internal/output"
 	"github.com/spf13/cobra"
+)
+
+var (
+	volumeCreateName   string
+	volumeCreateSize   int
+	volumeCreateRegion string
+	volumeCreateType   string
+	volumeCreateDesc   string
+	volumeDeleteForce  bool
 )
 
 func init() {
 	rootCmd.AddCommand(volumesCmd)
 	volumesCmd.AddCommand(volumesListCmd)
 	volumesCmd.AddCommand(volumesInfoCmd)
+	volumesCmd.AddCommand(volumesCreateCmd)
+	volumesCmd.AddCommand(volumesDeleteCmd)
+
+	volumesCreateCmd.Flags().StringVar(&volumeCreateName, "name", "", "Volume name (required)")
+	volumesCreateCmd.Flags().IntVar(&volumeCreateSize, "size", 0, "Volume size in GB (required, 1-1000)")
+	volumesCreateCmd.Flags().StringVar(&volumeCreateRegion, "region", "", "Region ID (defaults to the internal region)")
+	volumesCreateCmd.Flags().StringVar(&volumeCreateType, "type", "", "Volume type (NVMe|HDD|NVMe_Shared)")
+	volumesCreateCmd.Flags().StringVar(&volumeCreateDesc, "description", "", "Volume description")
+	volumesCreateCmd.MarkFlagRequired("name")
+	volumesCreateCmd.MarkFlagRequired("size")
+
+	volumesDeleteCmd.Flags().BoolVar(&volumeDeleteForce, "force", false, "Skip confirmation")
 }
 
 var volumesCmd = &cobra.Command{
@@ -67,6 +91,73 @@ var volumesListCmd = &cobra.Command{
 			}
 			output.PrintTable(headers, rows)
 		}
+		return nil
+	},
+}
+
+var volumesCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create (provision) a new network volume",
+	Long: `Create and provision a new network volume.
+
+The volume is provisioned on the default internal region unless --region is
+given. Use this to make a scratch/test volume for the 'files' subcommands.`,
+	Example: `  gpulab volumes create --name cli-test --size 10
+  gpulab volumes create --name data --size 200 --description "training data"`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth().WithTimeout(5 * time.Minute)
+		volume, err := client.CreateVolume(&api.CreateVolumeRequest{
+			VolumeName:  volumeCreateName,
+			VolumeSpace: volumeCreateSize,
+			RegionID:    volumeCreateRegion,
+			VolumeType:  volumeCreateType,
+			Description: volumeCreateDesc,
+		})
+		if err != nil {
+			return err
+		}
+		if flagJSON {
+			output.PrintJSON(volume)
+			return nil
+		}
+		output.PrintSuccess(fmt.Sprintf("Volume created: %s", volume.VolumeUUID))
+		fmt.Printf("Name:   %s\n", volume.VolumeName)
+		if volume.MaxSize != nil {
+			fmt.Printf("Size:   %d GB\n", *volume.MaxSize)
+		}
+		fmt.Printf("Status: %s\n", volume.Status)
+		return nil
+	},
+}
+
+var volumesDeleteCmd = &cobra.Command{
+	Use:     "delete [VOLUME]",
+	Aliases: []string{"rm", "remove"},
+	Short:   "Delete (deprovision) a network volume",
+	Args:    cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth()
+		uuid, err := client.ResolveVolumeUUID(args[0])
+		if err != nil {
+			return err
+		}
+		if !volumeDeleteForce && !flagJSON && !flagQuiet {
+			fmt.Printf("Delete volume %s? This deprovisions its storage. [y/N] ", uuid)
+			var confirm string
+			fmt.Scanln(&confirm)
+			if strings.ToLower(confirm) != "y" {
+				fmt.Println("Cancelled.")
+				return nil
+			}
+		}
+		if err := client.DeleteVolume(uuid); err != nil {
+			return err
+		}
+		if flagJSON {
+			output.PrintJSON(map[string]string{"status": "success", "action": "deleted", "uuid": uuid})
+			return nil
+		}
+		output.PrintSuccess(fmt.Sprintf("Volume deleted: %s", uuid))
 		return nil
 	},
 }
