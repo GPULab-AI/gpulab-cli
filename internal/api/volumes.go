@@ -3,7 +3,14 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 )
+
+// volumeUUIDPattern matches a full volume UUID (10-char nanoid). When the input
+// already looks like one, file commands skip the (potentially many-page) volume
+// listing and let the server validate it.
+var volumeUUIDPattern = regexp.MustCompile(`^[A-Za-z0-9]{10}$`)
 
 type Volume struct {
 	VolumeUUID string `json:"volumeUuid"`
@@ -16,23 +23,89 @@ type Volume struct {
 	UpdatedAt  string `json:"updatedAt"`
 }
 
-type VolumeListResponse struct {
-	Data  []Volume    `json:"data"`
-	Links interface{} `json:"links"`
-	Meta  interface{} `json:"meta"`
+type VolumeListMeta struct {
+	CurrentPage int `json:"current_page"`
+	LastPage    int `json:"last_page"`
 }
 
+type VolumeListResponse struct {
+	Data  []Volume       `json:"data"`
+	Links interface{}    `json:"links"`
+	Meta  VolumeListMeta `json:"meta"`
+}
+
+// ListVolumes returns every volume, following Laravel pagination so callers
+// are not silently truncated to the first page (default 15 per page).
 func (c *Client) ListVolumes() ([]Volume, error) {
-	data, err := c.Get("/v1/volumes")
-	if err != nil {
-		return nil, err
+	var all []Volume
+
+	for page := 1; ; page++ {
+		data, err := c.Get(fmt.Sprintf("/v1/volumes?page=%d", page))
+		if err != nil {
+			return nil, err
+		}
+
+		var resp VolumeListResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("failed to parse volumes: %w", err)
+		}
+
+		all = append(all, resp.Data...)
+
+		// Stop when there are no more pages. LastPage == 0 guards against a
+		// non-paginated response so we never loop forever.
+		if resp.Meta.LastPage <= page || len(resp.Data) == 0 {
+			break
+		}
 	}
 
-	var resp VolumeListResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse volumes: %w", err)
+	return all, nil
+}
+
+// ResolveVolumeUUID resolves a full UUID, UUID prefix, or volume name to a full
+// volume UUID so file commands can accept friendly identifiers.
+func (c *Client) ResolveVolumeUUID(partial string) (string, error) {
+	if partial == "" {
+		return "", fmt.Errorf("volume identifier required")
 	}
-	return resp.Data, nil
+
+	// Fast path: a full UUID needs no lookup (avoids paging the whole list).
+	if volumeUUIDPattern.MatchString(partial) {
+		return partial, nil
+	}
+
+	volumes, err := c.ListVolumes()
+	if err != nil {
+		return "", err
+	}
+
+	// Exact UUID or name match wins outright.
+	for _, v := range volumes {
+		if v.VolumeUUID == partial || strings.EqualFold(v.VolumeName, partial) {
+			return v.VolumeUUID, nil
+		}
+	}
+
+	var matches []Volume
+	lower := strings.ToLower(partial)
+	for _, v := range volumes {
+		if strings.HasPrefix(v.VolumeUUID, partial) || strings.Contains(strings.ToLower(v.VolumeName), lower) {
+			matches = append(matches, v)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no volume found matching %q", partial)
+	case 1:
+		return matches[0].VolumeUUID, nil
+	default:
+		msg := fmt.Sprintf("ambiguous volume identifier %q matches %d volumes:\n", partial, len(matches))
+		for _, m := range matches {
+			msg += fmt.Sprintf("  %s  %s\n", m.VolumeUUID, m.VolumeName)
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
 }
 
 func (c *Client) GetVolume(id string) (*Volume, error) {

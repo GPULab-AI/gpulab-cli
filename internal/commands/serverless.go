@@ -53,6 +53,7 @@ var (
 	serverlessForceDelete      bool
 	serverlessPage             int
 	serverlessPerPage          int
+	serverlessAllPages         bool
 	serverlessDetails          bool
 	serverlessReplica          string
 	serverlessDeployLogs       bool
@@ -93,10 +94,12 @@ func init() {
 
 	serverlessRequestsCmd.Flags().IntVar(&serverlessPage, "page", 1, "Page number")
 	serverlessRequestsCmd.Flags().IntVar(&serverlessPerPage, "per-page", 25, "Rows per page")
+	serverlessRequestsCmd.Flags().BoolVar(&serverlessAllPages, "all", false, "Fetch every page instead of just one")
 	serverlessRequestsCmd.Flags().BoolVar(&serverlessDetails, "details", false, "Print request/response bodies in human output")
 
 	serverlessAutoscalingLogsCmd.Flags().IntVar(&serverlessPage, "page", 1, "Page number")
 	serverlessAutoscalingLogsCmd.Flags().IntVar(&serverlessPerPage, "per-page", 25, "Rows per page")
+	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessAllPages, "all", false, "Fetch every page instead of just one")
 	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessDetails, "details", false, "Print metrics and context in human output")
 
 	serverlessLogsCmd.Flags().StringVar(&serverlessReplica, "replica", "", "Replica UUID or prefix (default: first running replica, use 'all' for every replica)")
@@ -347,7 +350,14 @@ var serverlessRequestsCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		page, err := client.ListServerlessRequests(identifier, serverlessPage, serverlessPerPage)
+		var page *api.ServerlessPage[api.ServerlessRequestLog]
+		if serverlessAllPages {
+			page, err = fetchAllServerlessPages(func(p int) (*api.ServerlessPage[api.ServerlessRequestLog], error) {
+				return client.ListServerlessRequests(identifier, p, serverlessPerPage)
+			})
+		} else {
+			page, err = client.ListServerlessRequests(identifier, serverlessPage, serverlessPerPage)
+		}
 		if err != nil {
 			return err
 		}
@@ -371,7 +381,14 @@ var serverlessAutoscalingLogsCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		page, err := client.ListServerlessAutoscalingLogs(identifier, serverlessPage, serverlessPerPage)
+		var page *api.ServerlessPage[api.ServerlessAutoscalingLog]
+		if serverlessAllPages {
+			page, err = fetchAllServerlessPages(func(p int) (*api.ServerlessPage[api.ServerlessAutoscalingLog], error) {
+				return client.ListServerlessAutoscalingLogs(identifier, p, serverlessPerPage)
+			})
+		} else {
+			page, err = client.ListServerlessAutoscalingLogs(identifier, serverlessPage, serverlessPerPage)
+		}
 		if err != nil {
 			return err
 		}
@@ -805,6 +822,27 @@ func resolveServerlessPolicyInputs(client *api.Client, templateKey string) (stri
 		return "", nil, fmt.Errorf("autoscaling policy is required (use --policy, --policy-file, or --autoscaling-template)")
 	}
 	return policy, metrics, nil
+}
+
+// fetchAllServerlessPages walks every page of a paginated serverless endpoint
+// and returns a single page containing all rows, so `--all` shows everything.
+func fetchAllServerlessPages[T any](fetch func(page int) (*api.ServerlessPage[T], error)) (*api.ServerlessPage[T], error) {
+	first, err := fetch(1)
+	if err != nil {
+		return nil, err
+	}
+	for p := 2; p <= first.LastPage; p++ {
+		next, err := fetch(p)
+		if err != nil {
+			return nil, err
+		}
+		first.Data = append(first.Data, next.Data...)
+	}
+	first.CurrentPage = 1
+	first.LastPage = 1
+	first.HasNextPage = false
+	first.HasPrevPage = false
+	return first, nil
 }
 
 func printServerlessServices(services []api.ServerlessService) {

@@ -30,8 +30,33 @@ func SetVersionInfo(version, commit, date string) {
 
 var rootCmd = &cobra.Command{
 	Use:   "gpulab",
-	Short: "GPULab CLI - Manage GPU containers from your terminal",
-	Long:  "GPULab CLI provides command-line access to GPULab GPU containers.\nDeploy, manage, and interact with containers running on GPU servers.",
+	Short: "GPULab CLI - Manage GPU containers, serverless endpoints, and volumes",
+	Long: `GPULab CLI provides command-line access to the GPULab platform: deploy and
+manage GPU containers, run serverless GPU endpoints, and work with network
+volumes (including their files).
+
+Authentication (in priority order):
+  1. --api-key flag
+  2. GPULAB_API_KEY environment variable
+  3. ~/.gpulab/config.json (run 'gpulab auth login')
+
+The API base URL defaults to https://gpulab.ai/api and can be overridden with
+--api-url or GPULAB_API_URL.
+
+Output modes (use these for scripting and AI agents):
+  --json     emit structured JSON instead of tables
+  --quiet/-q print only IDs, one per line
+  --debug    log every HTTP request/response to stderr
+
+Common commands:
+  gpulab ps                          list containers
+  gpulab logs <container> -f         stream container logs
+  gpulab volumes                     list network volumes
+  gpulab volumes files ls <volume>   browse files on a volume
+  gpulab serverless list             list serverless GPU endpoints`,
+	Example: `  gpulab ps --json
+  gpulab volumes files upload my-vol ./model.bin --dest models
+  gpulab serverless logs my-endpoint --follow`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }

@@ -16,8 +16,16 @@ func init() {
 var volumesCmd = &cobra.Command{
 	Use:     "volumes",
 	Aliases: []string{"vol"},
-	Short:   "Manage network volumes",
-	RunE:    volumesListCmd.RunE,
+	Short:   "Manage network volumes and their files",
+	Long: `List network volumes and manage the files stored on them.
+
+Running 'gpulab volumes' with no subcommand lists every volume (all pages).
+Use the 'files' subcommand to browse, upload, edit, and delete files.`,
+	Example: `  gpulab volumes                       # list all volumes
+  gpulab volumes info my-volume        # show one volume
+  gpulab volumes files ls my-volume    # list files on a volume
+  gpulab volumes files upload my-volume ./data.bin --dest datasets`,
+	RunE: volumesListCmd.RunE,
 }
 
 var volumesListCmd = &cobra.Command{
