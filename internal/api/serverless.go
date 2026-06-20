@@ -390,6 +390,32 @@ func (c *Client) CancelServerlessRequest(uuid string) error {
 	return err
 }
 
+type ServerlessReplicaActionResponse struct {
+	Status                 string `json:"status"`
+	Message                string `json:"message"`
+	UUID                   string `json:"uuid"`
+	ReplacementProvisioned bool   `json:"replacement_provisioned"`
+}
+
+func (c *Client) RestartServerlessReplica(identifier, replicaUUID string) (*ServerlessReplicaActionResponse, error) {
+	path := "/v1/serverless/" + url.PathEscape(identifier) + "/replicas/" + url.PathEscape(replicaUUID) + "/restart"
+	data, err := c.Post(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ServerlessReplicaActionResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse restart response: %w", err)
+	}
+	return &resp, nil
+}
+
+func (c *Client) DeleteServerlessReplica(identifier, replicaUUID string) error {
+	path := "/v1/serverless/" + url.PathEscape(identifier) + "/replicas/" + url.PathEscape(replicaUUID)
+	_, err := c.Delete(path)
+	return err
+}
+
 func (c *Client) ValidateServerlessPolicy(req *ServerlessPolicyValidationRequest) (*ServerlessPolicyValidationResponse, error) {
 	data, err := c.Post("/v1/serverless/autoscaling-policies/validate", req)
 	if err != nil {

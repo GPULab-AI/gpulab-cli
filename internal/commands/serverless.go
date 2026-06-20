@@ -67,6 +67,7 @@ var (
 	serverlessInvokeWait       bool
 	serverlessInvokeTimeout    int
 	serverlessWatchStatus      bool
+	serverlessReplicaForce     bool
 )
 
 func init() {
@@ -79,6 +80,8 @@ func init() {
 	serverlessCmd.AddCommand(serverlessDeleteCmd)
 	serverlessCmd.AddCommand(serverlessOptionsCmd)
 	serverlessCmd.AddCommand(serverlessReplicasCmd)
+	serverlessCmd.AddCommand(serverlessRestartReplicaCmd)
+	serverlessCmd.AddCommand(serverlessDeleteReplicaCmd)
 	serverlessCmd.AddCommand(serverlessRequestsCmd)
 	serverlessCmd.AddCommand(serverlessAutoscalingLogsCmd)
 	serverlessCmd.AddCommand(serverlessLogsCmd)
@@ -101,6 +104,8 @@ func init() {
 	serverlessAutoscalingLogsCmd.Flags().IntVar(&serverlessPerPage, "per-page", 25, "Rows per page")
 	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessAllPages, "all", false, "Fetch every page instead of just one")
 	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessDetails, "details", false, "Print metrics and context in human output")
+
+	serverlessDeleteReplicaCmd.Flags().BoolVar(&serverlessReplicaForce, "force", false, "Skip confirmation")
 
 	serverlessLogsCmd.Flags().StringVar(&serverlessReplica, "replica", "", "Replica UUID or prefix (default: first running replica, use 'all' for every replica)")
 	serverlessLogsCmd.Flags().BoolVar(&serverlessDeployLogs, "deploy", false, "Show deployment logs instead of runtime logs")
@@ -335,6 +340,78 @@ var serverlessReplicasCmd = &cobra.Command{
 			return nil
 		}
 		printServerlessReplicas(detail.Replicas)
+		return nil
+	},
+}
+
+var serverlessRestartReplicaCmd = &cobra.Command{
+	Use:   "restart-replica [ENDPOINT] [REPLICA]",
+	Short: "Restart a single replica (tears it down and re-provisions)",
+	Long: `Restart a single replica of a serverless endpoint.
+
+The replica is torn down and a fresh one is brought back up to the warm-pool
+minimum. For autoscaling endpoints the autoscaler reconciles on its next cycle.
+REPLICA may be a full UUID, a UUID prefix, or a server name (see 'serverless
+replicas <endpoint>').`,
+	Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth()
+		identifier, err := client.ResolveServerlessService(args[0])
+		if err != nil {
+			return err
+		}
+		replicaUUID, err := resolveServerlessReplicaUUID(client, identifier, args[1])
+		if err != nil {
+			return err
+		}
+		resp, err := client.RestartServerlessReplica(identifier, replicaUUID)
+		if err != nil {
+			return err
+		}
+		if flagJSON {
+			output.PrintJSON(resp)
+			return nil
+		}
+		output.PrintSuccess(fmt.Sprintf("Replica restarted: %s", shortID(replicaUUID)))
+		if resp.ReplacementProvisioned {
+			fmt.Println("A replacement replica is being provisioned.")
+		}
+		return nil
+	},
+}
+
+var serverlessDeleteReplicaCmd = &cobra.Command{
+	Use:     "delete-replica [ENDPOINT] [REPLICA]",
+	Aliases: []string{"rm-replica"},
+	Short:   "Delete a single replica of a serverless endpoint",
+	Args:    cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth()
+		identifier, err := client.ResolveServerlessService(args[0])
+		if err != nil {
+			return err
+		}
+		replicaUUID, err := resolveServerlessReplicaUUID(client, identifier, args[1])
+		if err != nil {
+			return err
+		}
+		if !serverlessReplicaForce && !flagJSON && !flagQuiet {
+			fmt.Printf("Delete replica %s of %s? [y/N] ", shortID(replicaUUID), shortID(identifier))
+			var confirm string
+			fmt.Scanln(&confirm)
+			if strings.ToLower(confirm) != "y" {
+				fmt.Println("Cancelled.")
+				return nil
+			}
+		}
+		if err := client.DeleteServerlessReplica(identifier, replicaUUID); err != nil {
+			return err
+		}
+		if flagJSON {
+			output.PrintJSON(map[string]string{"status": "success", "action": "deleted", "uuid": replicaUUID})
+			return nil
+		}
+		output.PrintSuccess(fmt.Sprintf("Replica deleted: %s", shortID(replicaUUID)))
 		return nil
 	},
 }
@@ -883,34 +960,140 @@ func printServerlessServices(services []api.ServerlessService) {
 
 func printServerlessDetail(detail *api.ServerlessDetail) {
 	service := detail.Data
-	fmt.Printf("UUID:         %s\n", service.UUID)
-	fmt.Printf("Name:         %s\n", service.Name)
-	fmt.Printf("Status:       %s\n", boolStatus(service.IsEnabled, "active", "paused"))
-	fmt.Printf("Endpoint key: %s\n", service.EndpointKey)
-	fmt.Printf("URL:          %s\n", service.EndpointURL)
-	fmt.Printf("Template:     %s\n", service.TemplateName)
-	fmt.Printf("GPU:          %s x%d\n", service.GPUTypeName, service.GPUCount)
-	fmt.Printf("Memory:       %d GB\n", service.Memory)
+	fmt.Printf("UUID:          %s\n", service.UUID)
+	fmt.Printf("Name:          %s\n", service.Name)
+	fmt.Printf("Status:        %s\n", boolStatus(service.IsEnabled, "active", "paused"))
+	fmt.Printf("Endpoint key:  %s\n", service.EndpointKey)
+	fmt.Printf("URL:           %s\n", service.EndpointURL)
+	fmt.Printf("Template:      %s\n", service.TemplateName)
 	if service.RegionName != "" {
-		fmt.Printf("Region:       %s\n", service.RegionName)
+		fmt.Printf("Region:        %s\n", service.RegionName)
 	}
-	if service.NetworkVolumeName != "" {
-		fmt.Printf("Volume:       %s\n", service.NetworkVolumeName)
+
+	fmt.Printf("\nResources:\n")
+	fmt.Printf("  GPU:         %s x%d\n", service.GPUTypeName, service.GPUCount)
+	fmt.Printf("  Memory:      %d GB\n", service.Memory)
+	fmt.Printf("  Port:        %d\n", service.EndpointPort)
+	fmt.Printf("  Health:      %s\n", service.HealthCheckPath)
+	fmt.Printf("  Pull policy: %s\n", service.ImagePullPolicy)
+	if service.CUDAVersion != "" {
+		fmt.Printf("  CUDA:        %s\n", service.CUDAVersion)
 	}
-	fmt.Printf("Port:         %d\n", service.EndpointPort)
-	fmt.Printf("Health:       %s\n", service.HealthCheckPath)
-	fmt.Printf("Replicas:     %d active, %d provisioning, max %d\n", service.ActiveReplicasCount, service.ProvisioningReplicasCount, service.MaxReplicas)
-	fmt.Printf("Concurrency:  %d per replica\n", service.MaxConcurrentRequests)
-	fmt.Printf("Requests:     %d total, %d queued\n", service.TotalRequestsCount, service.QueuedRequestsCount)
-	fmt.Printf("Autoscaling:  %s\n", boolStatus(service.AutoscalingEnabled, "enabled", "disabled"))
+
+	fmt.Printf("\nNetwork Volume:\n")
+	if service.NetworkVolumeName != "" || service.NetworkVolumeUUID != "" {
+		fmt.Printf("  Name:        %s\n", service.NetworkVolumeName)
+		if service.NetworkVolumeUUID != "" {
+			fmt.Printf("  UUID:        %s\n", service.NetworkVolumeUUID)
+		}
+		if service.NetworkVolumeMaxSize != nil {
+			fmt.Printf("  Size:        %d GB\n", *service.NetworkVolumeMaxSize)
+		}
+		if service.TemplateVolumeMountPath != "" {
+			fmt.Printf("  Mount path:  %s\n", service.TemplateVolumeMountPath)
+		}
+	} else {
+		fmt.Printf("  (none)\n")
+	}
+
+	fmt.Printf("\nScaling:\n")
+	fmt.Printf("  Replicas:    %d active, %d provisioning (min %d, max %d)\n", service.ActiveReplicasCount, service.ProvisioningReplicasCount, service.MinReplicas, service.MaxReplicas)
+	fmt.Printf("  Concurrency: %d per replica\n", service.MaxConcurrentRequests)
+	fmt.Printf("  Overflow:    %s\n", boolStatus(service.AllowOverflowRequests, "enabled", "disabled"))
+	fmt.Printf("  Autoscaling: %s\n", boolStatus(service.AutoscalingEnabled, "enabled", "disabled"))
+	if service.AutoscalingTemplateKey != "" {
+		fmt.Printf("  Template:    %s\n", service.AutoscalingTemplateKey)
+	}
+	if service.AutoscalingPolicyCode != "" {
+		fmt.Printf("  Policy:      %s\n", summarizeText(service.AutoscalingPolicyCode))
+	}
+	if service.AutoscalingMetricsConfig != "" {
+		fmt.Printf("  Metrics:     %s\n", summarizeText(service.AutoscalingMetricsConfig))
+	}
+	if service.AutoscalingLastEvaluatedAt != "" {
+		fmt.Printf("  Last eval:   %s\n", shortTime(service.AutoscalingLastEvaluatedAt))
+	}
+	if service.AutoscalingLastErrorAt != "" {
+		fmt.Printf("  Last error:  %s\n", shortTime(service.AutoscalingLastErrorAt))
+	}
+
+	fmt.Printf("\nTimeouts:\n")
+	fmt.Printf("  Idle:        %ds\n", service.IdleTimeoutSeconds)
+	fmt.Printf("  Cold start:  %ds\n", service.ColdStartTimeoutSeconds)
+	fmt.Printf("  Request:     %ds\n", service.RequestTimeoutSeconds)
+
+	fmt.Printf("\nTraffic:\n")
+	fmt.Printf("  Requests:    %d total, %d queued\n", service.TotalRequestsCount, service.QueuedRequestsCount)
+	if service.LastInvokedAt != "" {
+		fmt.Printf("  Last invoke: %s\n", shortTime(service.LastInvokedAt))
+	}
+	if service.LastScaledAt != "" {
+		fmt.Printf("  Last scaled: %s\n", shortTime(service.LastScaledAt))
+	}
+
+	if len(service.EnvironmentVariablesMap) > 0 {
+		fmt.Printf("\nEnvironment:   %d variable(s)\n", len(service.EnvironmentVariablesMap))
+	}
 	if service.Command != "" {
-		fmt.Printf("Command:      %s\n", service.Command)
+		fmt.Printf("Command:       %s\n", service.Command)
 	}
 	if service.Notes != "" {
-		fmt.Printf("Notes:        %s\n", service.Notes)
+		fmt.Printf("Notes:         %s\n", service.Notes)
 	}
+
 	fmt.Printf("\nReplicas:\n")
 	printServerlessReplicas(detail.Replicas)
+
+	if len(detail.AutoscalingLogs.Data) > 0 {
+		fmt.Printf("\nRecent autoscaling logs:\n")
+		printServerlessAutoscalingLogs(&detail.AutoscalingLogs, false)
+	}
+}
+
+// summarizeText collapses a possibly-multiline config value to a single line for
+// summary display; the full value is available via --json.
+func summarizeText(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(none)"
+	}
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return fmt.Sprintf("%s … (%d lines)", strings.TrimSpace(s[:idx]), strings.Count(s, "\n")+1)
+	}
+	if len(s) > 70 {
+		return s[:67] + "..."
+	}
+	return s
+}
+
+// resolveServerlessReplicaUUID maps a full UUID, UUID prefix, or server name to
+// a replica UUID within the given endpoint.
+func resolveServerlessReplicaUUID(client *api.Client, identifier, partial string) (string, error) {
+	detail, err := client.GetServerlessService(identifier)
+	if err != nil {
+		return "", err
+	}
+	var matches []api.ServerlessReplica
+	for _, replica := range detail.Replicas {
+		if replica.UUID == partial {
+			return replica.UUID, nil
+		}
+		if strings.HasPrefix(replica.UUID, partial) || strings.HasPrefix(replica.ServerName, partial) {
+			matches = append(matches, replica)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no replica found matching %q (run 'gpulab serverless replicas %s' to list)", partial, partial)
+	case 1:
+		return matches[0].UUID, nil
+	default:
+		msg := fmt.Sprintf("ambiguous replica %q matches %d replicas:\n", partial, len(matches))
+		for _, m := range matches {
+			msg += fmt.Sprintf("  %s  %s  %s\n", m.UUID, m.ServerName, m.Status)
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
 }
 
 func printServerlessReplicas(replicas []api.ServerlessReplica) {
