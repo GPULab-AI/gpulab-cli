@@ -17,6 +17,8 @@ var (
 	volumeCreateType   string
 	volumeCreateDesc   string
 	volumeDeleteForce  bool
+	volumeCloneName    string
+	volumeCloneSize    int
 )
 
 func init() {
@@ -24,7 +26,12 @@ func init() {
 	volumesCmd.AddCommand(volumesListCmd)
 	volumesCmd.AddCommand(volumesInfoCmd)
 	volumesCmd.AddCommand(volumesCreateCmd)
+	volumesCmd.AddCommand(volumesCloneCmd)
 	volumesCmd.AddCommand(volumesDeleteCmd)
+
+	volumesCloneCmd.Flags().StringVar(&volumeCloneName, "name", "", "Name for the cloned volume (required)")
+	volumesCloneCmd.Flags().IntVar(&volumeCloneSize, "size", 0, "Size of the clone in GB (default: source volume size)")
+	volumesCloneCmd.MarkFlagRequired("name")
 
 	volumesCreateCmd.Flags().StringVar(&volumeCreateName, "name", "", "Volume name (required)")
 	volumesCreateCmd.Flags().IntVar(&volumeCreateSize, "size", 0, "Volume size in GB (required, 1-1000)")
@@ -121,6 +128,61 @@ given. Use this to make a scratch/test volume for the 'files' subcommands.`,
 			return nil
 		}
 		output.PrintSuccess(fmt.Sprintf("Volume created: %s", volume.VolumeUUID))
+		fmt.Printf("Name:   %s\n", volume.VolumeName)
+		if volume.MaxSize != nil {
+			fmt.Printf("Size:   %d GB\n", *volume.MaxSize)
+		}
+		fmt.Printf("Status: %s\n", volume.Status)
+		return nil
+	},
+}
+
+var volumesCloneCmd = &cobra.Command{
+	Use:     "clone [SOURCE]",
+	Aliases: []string{"duplicate", "copy"},
+	Short:   "Clone a network volume (copies its data into a new volume)",
+	Long: `Clone an existing network volume into a new one, copying its data on the
+NFS backend.
+
+SOURCE may be a full UUID, a UUID prefix, or the volume name. The clone is
+provisioned in the same region as the source. If --size is omitted, the source
+volume's size is used.`,
+	Example: `  gpulab volumes clone my-volume --name my-volume-copy
+  gpulab volumes clone abc123 --name backup --size 200`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth().WithTimeout(10 * time.Minute)
+		sourceUUID, err := client.ResolveVolumeUUID(args[0])
+		if err != nil {
+			return err
+		}
+
+		size := volumeCloneSize
+		if size <= 0 {
+			source, err := client.GetVolume(sourceUUID)
+			if err != nil {
+				return err
+			}
+			if source.MaxSize != nil {
+				size = *source.MaxSize
+			}
+			if size <= 0 {
+				return fmt.Errorf("could not determine source volume size; pass --size")
+			}
+		}
+
+		volume, err := client.CloneVolume(sourceUUID, &api.CloneVolumeRequest{
+			NewVolumeName: volumeCloneName,
+			VolumeSpace:   size,
+		})
+		if err != nil {
+			return err
+		}
+		if flagJSON {
+			output.PrintJSON(volume)
+			return nil
+		}
+		output.PrintSuccess(fmt.Sprintf("Volume cloned: %s", volume.VolumeUUID))
 		fmt.Printf("Name:   %s\n", volume.VolumeName)
 		if volume.MaxSize != nil {
 			fmt.Printf("Size:   %d GB\n", *volume.MaxSize)

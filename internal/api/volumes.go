@@ -152,3 +152,24 @@ func (c *Client) DeleteVolume(uuid string) error {
 	_, err := c.Delete("/v1/volumes/" + uuid)
 	return err
 }
+
+// CloneVolumeRequest is the payload for duplicating an existing volume.
+type CloneVolumeRequest struct {
+	NewVolumeName string `json:"new_volume_name"`
+	VolumeSpace   int    `json:"volume_space"`
+}
+
+func (c *Client) CloneVolume(sourceUUID string, req *CloneVolumeRequest) (*Volume, error) {
+	data, err := c.Post("/v1/volumes/"+sourceUUID+"/duplicate", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Data Volume `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse cloned volume: %w", err)
+	}
+	return &resp.Data, nil
+}
