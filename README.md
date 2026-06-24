@@ -171,6 +171,31 @@ gpulab serverless update llama-api --max-replicas 4 --autoscaling-template pendi
 gpulab serverless delete llama-api --force
 ```
 
+## Templates (Docker images)
+
+Create and manage reusable container templates. Only `--name` and `--image` are
+required; visibility defaults to `private`, container type to `gpu`, disk to 10GB.
+
+```bash
+# List, inspect, and discover categories
+gpulab templates
+gpulab templates info my-template
+gpulab templates categories
+
+# Create
+gpulab templates create --name web --image nginx:latest --ports 80,443
+gpulab templates create --name trainer --image pytorch/pytorch:latest \
+  --type gpu --memory 24 --disk 50 --mount-path /workspace \
+  -e WANDB_API_KEY=xxx --env-file ./train.env
+
+# Edit (only the flags you pass change) and delete
+gpulab templates edit my-template --image nginx:1.27 --visibility public
+gpulab templates delete my-template --force
+```
+
+The target for `info`/`edit`/`delete` may be a full UUID, a UUID prefix, or the
+template name.
+
 ## Commands
 
 | Command | Description |
@@ -189,7 +214,12 @@ gpulab serverless delete llama-api --force
 | `gpulab stats <uuid>` | View resource usage |
 | `gpulab exec <uuid> -- <cmd>` | Execute a command |
 | `gpulab ssh <uuid>` | Interactive terminal |
-| `gpulab templates` | List templates |
+| `gpulab templates` | List templates (Docker images) |
+| `gpulab templates info <uuid\|name>` | Show template details |
+| `gpulab templates categories` | List template categories |
+| `gpulab templates create --name <n> --image <img>` | Create a template |
+| `gpulab templates edit <uuid\|name> [flags]` | Edit a template |
+| `gpulab templates delete <uuid\|name>` | Delete a template |
 | `gpulab gpus types` | List GPU types |
 | `gpulab volumes` | List volumes |
 | `gpulab serverless` | Manage serverless GPU endpoints |
