@@ -10,27 +10,30 @@ import (
 )
 
 var (
-	tplName        string
-	tplImage       string
-	tplDescription string
-	tplVisibility  string
-	tplType        string
-	tplCategory    int
-	tplCredentials int
-	tplMountPath   string
-	tplPorts       string
-	tplEnv         []string
-	tplEnvFile     string
-	tplCommand     string
-	tplDisk        int
-	tplVolumeDisk  int
-	tplMemory      int
-	tplPullPolicy  string
-	tplAuthorName  string
-	tplAuthorURL   string
-	tplThumbnail   string
-	tplNotes       string
-	tplDeleteForce bool
+	tplName             string
+	tplImage            string
+	tplDescription      string
+	tplVisibility       string
+	tplType             string
+	tplCategory         int
+	tplCredentials      int
+	tplRegistry         string
+	tplRegistryUsername string
+	tplRegistryPassword string
+	tplMountPath        string
+	tplPorts            string
+	tplEnv              []string
+	tplEnvFile          string
+	tplCommand          string
+	tplDisk             int
+	tplVolumeDisk       int
+	tplMemory           int
+	tplPullPolicy       string
+	tplAuthorName       string
+	tplAuthorURL        string
+	tplThumbnail        string
+	tplNotes            string
+	tplDeleteForce      bool
 )
 
 func init() {
@@ -61,7 +64,10 @@ func addTemplateWriteFlags(cmd *cobra.Command) {
 	f.StringVar(&tplVisibility, "visibility", "", "Visibility: public|private (default private)")
 	f.StringVar(&tplType, "type", "", "Container type: gpu|cpu (default gpu)")
 	f.IntVar(&tplCategory, "category", 0, "Category ID (see 'gpulab templates categories')")
-	f.IntVar(&tplCredentials, "credentials", 0, "Docker credentials ID (for private images)")
+	f.IntVar(&tplCredentials, "credentials", 0, "Docker credentials ID (for private images; see 'gpulab credentials')")
+	f.StringVar(&tplRegistry, "registry", "", "Registry host for inline credentials (default docker.io)")
+	f.StringVar(&tplRegistryUsername, "registry-username", "", "Registry username; creates+links a credential inline")
+	f.StringVar(&tplRegistryPassword, "registry-password", "", "Registry password/token; creates+links a credential inline")
 	f.StringVar(&tplMountPath, "mount-path", "", "Volume mount path inside the container")
 	f.StringVar(&tplPorts, "ports", "", "Exposed ports, comma-separated (e.g. 80,443,8080-8085)")
 	f.StringArrayVarP(&tplEnv, "env", "e", nil, "Environment variable KEY=VALUE (repeatable; bare KEY inherits from host)")
@@ -79,6 +85,7 @@ func addTemplateWriteFlags(cmd *cobra.Command) {
 
 var templateWriteFlagNames = []string{
 	"name", "image", "description", "visibility", "type", "category", "credentials",
+	"registry", "registry-username", "registry-password",
 	"mount-path", "ports", "env", "env-file", "command", "disk", "volume-disk",
 	"memory", "pull-policy", "author-name", "author-url", "thumbnail", "notes",
 }
@@ -143,6 +150,18 @@ func buildTemplateRequest(cmd *cobra.Command) (*api.TemplateRequest, error) {
 	if f.Changed("credentials") {
 		v := tplCredentials
 		req.CredentialsID = &v
+	}
+	if f.Changed("registry") {
+		v := tplRegistry
+		req.Registry = &v
+	}
+	if f.Changed("registry-username") {
+		v := tplRegistryUsername
+		req.RegistryUsername = &v
+	}
+	if f.Changed("registry-password") {
+		v := tplRegistryPassword
+		req.RegistryPassword = &v
 	}
 	if f.Changed("disk") {
 		v := tplDisk

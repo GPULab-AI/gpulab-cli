@@ -196,6 +196,29 @@ gpulab templates delete my-template --force
 The target for `info`/`edit`/`delete` may be a full UUID, a UUID prefix, or the
 template name.
 
+### Private images
+
+For images that need a registry login, attach Docker credentials. Set them inline
+when creating the template (the credential is created and linked in one call):
+
+```bash
+gpulab templates create --name private-trainer --image adhik/private:v1 \
+  --registry-username adhik --registry-password dckr_pat_xxx
+# --registry defaults to docker.io; pass it for ghcr.io, quay.io, etc.
+```
+
+Or manage credentials as reusable, named resources and reference them by ID:
+
+```bash
+# Store once (use --password-stdin to keep the token out of shell history)
+echo "$DOCKER_TOKEN" | gpulab credentials add --username adhik --password-stdin
+gpulab credentials                 # list — shows the ID
+gpulab templates create --name app --image adhik/private:v1 --credentials 42
+gpulab credentials rm 42           # delete when no longer needed
+```
+
+Passwords/tokens are write-only — they are never returned by `credentials list`.
+
 ## Commands
 
 | Command | Description |
@@ -220,6 +243,9 @@ template name.
 | `gpulab templates create --name <n> --image <img>` | Create a template |
 | `gpulab templates edit <uuid\|name> [flags]` | Edit a template |
 | `gpulab templates delete <uuid\|name>` | Delete a template |
+| `gpulab credentials` | List Docker registry credentials |
+| `gpulab credentials add --username <u> --password <p>` | Store a registry credential |
+| `gpulab credentials rm <id>` | Delete a registry credential |
 | `gpulab gpus types` | List GPU types |
 | `gpulab volumes` | List volumes |
 | `gpulab serverless` | Manage serverless GPU endpoints |

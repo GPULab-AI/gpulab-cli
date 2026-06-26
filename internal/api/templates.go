@@ -113,16 +113,22 @@ type TemplateCategory struct {
 // TemplateRequest is the create/update payload. Pointer and omitempty fields let
 // the edit command send only the flags the user actually changed (partial PUT).
 type TemplateRequest struct {
-	Name                 string            `json:"name,omitempty"`
-	DockerImage          string            `json:"docker_image,omitempty"`
-	Description          *string           `json:"description,omitempty"`
-	AuthorURL            *string           `json:"author_url,omitempty"`
-	AuthorName           *string           `json:"author_name,omitempty"`
-	Thumbnail            *string           `json:"thumbnail,omitempty"`
-	Visibility           string            `json:"visibility,omitempty"`
-	ContainerType        string            `json:"container_type,omitempty"`
-	CategoryID           *int              `json:"category_id,omitempty"`
-	CredentialsID        *int              `json:"credentials_id,omitempty"`
+	Name          string  `json:"name,omitempty"`
+	DockerImage   string  `json:"docker_image,omitempty"`
+	Description   *string `json:"description,omitempty"`
+	AuthorURL     *string `json:"author_url,omitempty"`
+	AuthorName    *string `json:"author_name,omitempty"`
+	Thumbnail     *string `json:"thumbnail,omitempty"`
+	Visibility    string  `json:"visibility,omitempty"`
+	ContainerType string  `json:"container_type,omitempty"`
+	CategoryID    *int    `json:"category_id,omitempty"`
+	CredentialsID *int    `json:"credentials_id,omitempty"`
+	// Inline registry credentials. When username + password are set, the API
+	// creates a credential and links it, so a private image needs no separate
+	// 'credentials add' step. Registry defaults to docker.io server-side.
+	Registry             *string           `json:"registry,omitempty"`
+	RegistryUsername     *string           `json:"registry_username,omitempty"`
+	RegistryPassword     *string           `json:"registry_password,omitempty"`
 	VolumeMountPath      *string           `json:"volume_mount_path,omitempty"`
 	ExposedPorts         *string           `json:"exposed_ports,omitempty"`
 	EnvironmentVariables map[string]string `json:"environment_variables,omitempty"`
