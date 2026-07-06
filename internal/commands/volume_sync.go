@@ -20,6 +20,9 @@ var (
 	syncDryRun     bool
 	syncDepth      int
 	syncIncludeAll bool
+	syncSizeOnly   bool
+	syncNoVerify   bool
+	syncAllowEmpty bool
 )
 
 func init() {
@@ -28,7 +31,10 @@ func init() {
 	volumesSyncCmd.Flags().BoolVarP(&syncYes, "yes", "y", false, "Skip confirmation")
 	volumesSyncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show the plan and exit without changing anything")
 	volumesSyncCmd.Flags().IntVar(&syncDepth, "depth", 20, "Max remote directory depth to scan")
-	volumesSyncCmd.Flags().BoolVar(&syncIncludeAll, "all", false, "Include hidden/noise files (.git, __pycache__, *.pyc)")
+	volumesSyncCmd.Flags().BoolVar(&syncIncludeAll, "all", false, "Include hidden/secret files (.git, __pycache__, *.pyc, .env, keys)")
+	volumesSyncCmd.Flags().BoolVar(&syncSizeOnly, "size-only", false, "Compare by size only (faster, but misses equal-length edits)")
+	volumesSyncCmd.Flags().BoolVar(&syncNoVerify, "no-verify", false, "Skip hash verification of uploaded files")
+	volumesSyncCmd.Flags().BoolVar(&syncAllowEmpty, "allow-empty", false, "Allow --delete when the local dir has no files (dangerous)")
 }
 
 type syncAction struct {
@@ -44,13 +50,14 @@ var volumesSyncCmd = &cobra.Command{
 	Use:   "sync [LOCAL_DIR] [VOLUME] [REMOTE_DIR]",
 	Short: "Sync a local directory to a volume (rsync-style, with a diff preview)",
 	Long: `Upload a local directory to a network volume, uploading only files that are new
-or changed (compared by size). Prints a diff preview and how many serverless
-endpoints/replicas use the volume before doing anything — those replicas keep
-running the old code until they are restarted (see 'serverless deploy').
+or changed. Files are compared by content hash (so an equal-length edit is still
+detected); pass --size-only for a faster size-only comparison. Uploaded files
+are read back and hash-verified unless --no-verify. Prints a diff preview and
+how many serverless endpoints/replicas use the volume before doing anything —
+those replicas keep running the old code until they are restarted (see
+'serverless deploy').
 
 REMOTE_DIR scopes the sync to a subdirectory of the volume (default: root).
-Comparison is size-based (rsync --size-only); use 'serverless deploy' when you
-need byte-identical verification.
 
 Examples:
   gpulab volumes sync ./server my-vol server           # preview + upload changes
@@ -83,20 +90,34 @@ Examples:
 			return err
 		}
 
-		// A missing remote dir (first sync) just means everything is new.
-		remoteFiles := map[string]int64{}
-		if remoteList, rerr := listVolumeFilesRecursive(client, uuid, remoteRoot, syncDepth); rerr == nil {
-			prefix := ""
-			if remoteRoot != "" {
-				prefix = remoteRoot + "/"
-			}
-			for _, f := range remoteList {
-				rel := strings.TrimPrefix(f.Path, prefix)
-				remoteFiles[rel] = f.Size
-			}
+		// Refuse to delete everything from an empty/wrong local dir unless the
+		// caller explicitly opts in — this is the volume-wipe footgun.
+		if syncDelete && len(localFiles) == 0 && !syncAllowEmpty {
+			return fmt.Errorf("refusing to --delete with an empty local dir %q (this would wipe the volume); pass --allow-empty to override", localDir)
 		}
 
-		actions := diffSync(localDir, remoteRoot, localFiles, remoteFiles, syncDelete)
+		// Only a genuine 404 means "remote dir doesn't exist yet" (first sync);
+		// a 403/500/wrong-volume must abort, not masquerade as an empty remote.
+		remoteFiles := map[string]int64{}
+		remoteList, truncated, rerr := listVolumeFilesRecursive(client, uuid, remoteRoot, syncDepth)
+		if rerr != nil && !api.IsNotFound(rerr) {
+			return fmt.Errorf("listing remote %q failed: %w", remoteRoot, rerr)
+		}
+		prefix := ""
+		if remoteRoot != "" {
+			prefix = remoteRoot + "/"
+		}
+		for _, f := range remoteList {
+			remoteFiles[strings.TrimPrefix(f.Path, prefix)] = f.Size
+		}
+		if truncated && !flagJSON {
+			fmt.Fprintf(os.Stderr, "warning: remote scan hit the depth limit (%d); files deeper than that are ignored — raise --depth\n", syncDepth)
+		}
+
+		actions, err := diffSync(client, uuid, localDir, remoteRoot, localFiles, remoteFiles, syncDelete, syncSizeOnly)
+		if err != nil {
+			return err
+		}
 		sort.Slice(actions, func(i, j int) bool { return actions[i].Rel < actions[j].Rel })
 
 		// Who is affected — a strong signal that replicas won't pick up the
@@ -109,6 +130,12 @@ Examples:
 		}
 
 		unchanged := len(localFiles) - countKind(actions, "new") - countKind(actions, "changed")
+		pending := countKind(actions, "new") + countKind(actions, "changed") + countKind(actions, "delete")
+
+		// Whether we will actually mutate the volume. Non-interactive callers
+		// (--json, no TTY) must pass --yes; we never silently apply a plan they
+		// couldn't confirm — especially --delete.
+		willApply := pending > 0 && !syncDryRun && (syncYes || !flagJSON)
 
 		if flagJSON {
 			output.PrintJSON(map[string]interface{}{
@@ -121,13 +148,13 @@ Examples:
 				"affected_endpoints": len(affected),
 				"affected_replicas":  replicaCount,
 				"actions":            actions,
-				"applied":            !syncDryRun,
+				"verified":           !syncNoVerify,
+				"applied":            willApply && syncYes,
 			})
 		} else {
 			printSyncPlan(actions, unchanged, len(affected), replicaCount, uuid, remoteRoot)
 		}
 
-		pending := countKind(actions, "new") + countKind(actions, "changed") + countKind(actions, "delete")
 		if pending == 0 {
 			if !flagJSON {
 				fmt.Println("Already in sync.")
@@ -137,7 +164,11 @@ Examples:
 		if syncDryRun {
 			return nil
 		}
-		if !syncYes && !flagJSON {
+		if flagJSON && !syncYes {
+			// Preview only — refuse to mutate without explicit --yes in JSON mode.
+			return nil
+		}
+		if !syncYes {
 			fmt.Printf("Apply %d change(s) to volume %s? [y/N] ", pending, shortID(uuid))
 			var confirm string
 			fmt.Scanln(&confirm)
@@ -147,7 +178,7 @@ Examples:
 			}
 		}
 
-		return applySync(client, uuid, actions)
+		return applySync(client, uuid, actions, !syncNoVerify)
 	},
 }
 
@@ -171,9 +202,12 @@ func walkLocalDir(dir string, includeAll bool) (map[string]int64, error) {
 		if rerr != nil {
 			return rerr
 		}
-		fi, ierr := d.Info()
+		// os.Stat (not d.Info, which is lstat) so a symlink reports its target's
+		// size — matching the bytes we actually upload. Broken symlinks are
+		// skipped rather than aborting the whole walk.
+		fi, ierr := os.Stat(p)
 		if ierr != nil {
-			return ierr
+			return nil
 		}
 		files[filepath.ToSlash(rel)] = fi.Size()
 		return nil
@@ -181,7 +215,10 @@ func walkLocalDir(dir string, includeAll bool) (map[string]int64, error) {
 	return files, err
 }
 
-func diffSync(localDir, remoteRoot string, local, remote map[string]int64, withDelete bool) []syncAction {
+// diffSync computes the upload/delete plan. Unlike a size-only diff, same-size
+// files are content-hashed (unless sizeOnly) so an equal-length edit is still
+// detected — otherwise workers would keep old code (the stale-code trap).
+func diffSync(client *api.Client, uuid, localDir, remoteRoot string, local, remote map[string]int64, withDelete, sizeOnly bool) ([]syncAction, error) {
 	var actions []syncAction
 	remotePath := func(rel string) string {
 		if remoteRoot == "" {
@@ -191,12 +228,20 @@ func diffSync(localDir, remoteRoot string, local, remote map[string]int64, withD
 	}
 	for rel, lsz := range local {
 		rsz, exists := remote[rel]
-		switch {
-		case !exists:
-			actions = append(actions, syncAction{rel, filepath.Join(localDir, filepath.FromSlash(rel)), remotePath(rel), "new", lsz, 0})
-		case rsz != lsz:
-			actions = append(actions, syncAction{rel, filepath.Join(localDir, filepath.FromSlash(rel)), remotePath(rel), "changed", lsz, rsz})
+		rpath := remotePath(rel)
+		lpath := filepath.Join(localDir, filepath.FromSlash(rel))
+		changed, reason, err := remoteDiffersFromLocal(client, uuid, rpath, lpath, lsz, rsz, exists, sizeOnly)
+		if err != nil {
+			return nil, err
 		}
+		if !changed {
+			continue
+		}
+		kind := "changed"
+		if reason == "new" {
+			kind = "new"
+		}
+		actions = append(actions, syncAction{rel, lpath, rpath, kind, lsz, rsz})
 	}
 	if withDelete {
 		for rel, rsz := range remote {
@@ -205,10 +250,10 @@ func diffSync(localDir, remoteRoot string, local, remote map[string]int64, withD
 			}
 		}
 	}
-	return actions
+	return actions, nil
 }
 
-func applySync(client *api.Client, uuid string, actions []syncAction) error {
+func applySync(client *api.Client, uuid string, actions []syncAction, verify bool) error {
 	// Group uploads by destination directory to minimize requests.
 	uploads := map[string][]api.UploadItem{}
 	var deletes []syncAction
@@ -222,10 +267,25 @@ func applySync(client *api.Client, uuid string, actions []syncAction) error {
 		}
 	}
 
+	// Uploads before deletes so a mid-run failure never leaves the volume with
+	// files deleted but their replacements not yet written.
 	uploaded := 0
 	for dir, items := range uploads {
 		if _, err := client.UploadVolumeFiles(uuid, dir, items); err != nil {
 			return fmt.Errorf("upload to %q failed: %w", dir, err)
+		}
+		// Verify each upload read back byte-identical, so a corrupted upload is
+		// caught here rather than silently serving bad code.
+		if verify {
+			for _, it := range items {
+				remote := it.DestName
+				if dir != "" {
+					remote = dir + "/" + it.DestName
+				}
+				if err := verifyReadback(client, uuid, remote, it.LocalPath); err != nil {
+					return err
+				}
+			}
 		}
 		uploaded += len(items)
 		if !flagJSON {
@@ -294,27 +354,30 @@ func countKind(actions []syncAction, kind string) int {
 }
 
 // listVolumeFilesRecursive lists every file under dir, walking up to maxDepth
-// directory levels.
-func listVolumeFilesRecursive(client *api.Client, uuid, dir string, maxDepth int) ([]api.VolumeFile, error) {
+// directory levels. truncated is true if a subdirectory was skipped because the
+// depth limit was reached (so the diff isn't silently incomplete).
+func listVolumeFilesRecursive(client *api.Client, uuid, dir string, maxDepth int) (files []api.VolumeFile, truncated bool, err error) {
 	resp, err := client.ListVolumeFiles(uuid, dir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var files []api.VolumeFile
 	for _, item := range resp.Items {
 		if item.IsDirectory {
-			if maxDepth > 0 {
-				child, cerr := listVolumeFilesRecursive(client, uuid, item.Path, maxDepth-1)
-				if cerr != nil {
-					return nil, cerr
-				}
-				files = append(files, child...)
+			if maxDepth <= 0 {
+				truncated = true
+				continue
 			}
+			child, childTruncated, cerr := listVolumeFilesRecursive(client, uuid, item.Path, maxDepth-1)
+			if cerr != nil {
+				return nil, false, cerr
+			}
+			truncated = truncated || childTruncated
+			files = append(files, child...)
 			continue
 		}
 		files = append(files, item)
 	}
-	return files, nil
+	return files, truncated, nil
 }
 
 func syncSkipDir(name string) bool {
@@ -327,10 +390,15 @@ func syncSkipDir(name string) bool {
 
 func syncSkipFile(name string) bool {
 	lower := strings.ToLower(name)
-	if lower == ".ds_store" {
+	// Never push local secrets to a (possibly shared) volume by default.
+	switch lower {
+	case ".ds_store", ".env", ".netrc", ".npmrc", ".git-credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
 		return true
 	}
-	for _, suffix := range []string{".pyc", ".pyo", ".swp", ".swo"} {
+	if strings.HasPrefix(lower, ".env.") {
+		return true
+	}
+	for _, suffix := range []string{".pyc", ".pyo", ".swp", ".swo", ".pem"} {
 		if strings.HasSuffix(lower, suffix) {
 			return true
 		}

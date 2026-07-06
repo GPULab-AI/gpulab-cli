@@ -20,6 +20,9 @@ var logIssuePatterns = []logIssuePattern{
 	{"OutOfMemoryError", "cuda-oom"},
 	{"CUDA error: out of memory", "cuda-oom"},
 	{"torch.cuda.OutOfMemoryError", "cuda-oom"},
+	{"device-side assert", "cuda-assert"},
+	{"CUDA error", "cuda-error"},
+	{"illegal memory access", "cuda-error"},
 	{"OOMKilled", "oom-killed"},
 	{"Segmentation fault", "segfault"},
 	{"core dumped", "segfault"},
@@ -28,8 +31,12 @@ var logIssuePatterns = []logIssuePattern{
 	{"Address already in use", "port-conflict"},
 	{"Connection refused", "connection-refused"},
 	{"RuntimeError", "runtime-error"},
-	{"AssertionError", "assertion-error"},
+	{"AttributeError", "attribute-error"},
+	{"ValueError", "value-error"},
+	{"TypeError", "type-error"},
+	{"IndexError", "index-error"},
 	{"KeyError", "key-error"},
+	{"AssertionError", "assertion-error"},
 }
 
 // logIssue summarizes one detected problem category in a log blob.
@@ -49,12 +56,18 @@ func detectLogIssues(logs string) []logIssue {
 	counts := map[string]int{}
 	samples := map[string]string{}
 	for _, line := range strings.Split(logs, "\n") {
+		// Count each matching LINE once per category — overlapping patterns in
+		// the same category (e.g. NoneType) must not inflate the count ×N.
+		seen := map[string]bool{}
 		for _, p := range logIssuePatterns {
 			if strings.Contains(line, p.needle) {
-				counts[p.category]++
-				if samples[p.category] == "" {
-					samples[p.category] = strings.TrimSpace(line)
-				}
+				seen[p.category] = true
+			}
+		}
+		for cat := range seen {
+			counts[cat]++
+			if samples[cat] == "" {
+				samples[cat] = strings.TrimSpace(line)
 			}
 		}
 	}

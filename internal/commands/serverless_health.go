@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/GPULab-AI/gpulab-cli/internal/api"
 	"github.com/GPULab-AI/gpulab-cli/internal/output"
@@ -45,9 +46,13 @@ OOMs.`,
 
 		// Recent requests, up to the limit.
 		var reqs []api.ServerlessRequestLog
+		var reqFetchErr error
 		for page := 1; len(reqs) < healthLimit; page++ {
 			p, perr := client.ListServerlessRequests(identifier, page, 100)
 			if perr != nil {
+				if page == 1 {
+					reqFetchErr = perr
+				}
 				break
 			}
 			reqs = append(reqs, p.Data...)
@@ -73,7 +78,7 @@ OOMs.`,
 			stale, _ = computeReplicaStaleness(client, svc.NetworkVolumeUUID, "", detail.Replicas, 2)
 		}
 
-		verdict := healthVerdict(stats, svc, issues)
+		verdict := healthVerdict(stats, svc, issues, reqFetchErr == nil)
 
 		if flagJSON {
 			output.PrintJSON(map[string]interface{}{
@@ -101,6 +106,7 @@ type requestStats struct {
 	NotFound  int            `json:"not_found"`
 	ServerErr int            `json:"server_errors"`
 	Errored   int            `json:"errored"`
+	Errors    int            `json:"errors"` // deduplicated: 5xx OR errored (each request once)
 	Statuses  map[string]int `json:"statuses"`
 	AvgMS     int64          `json:"avg_ms"`
 	P95MS     int64          `json:"p95_ms"`
@@ -115,6 +121,7 @@ func computeRequestStats(reqs []api.ServerlessRequestLog) requestStats {
 		if r.Status != "" {
 			s.Statuses[r.Status]++
 		}
+		isErr := false
 		if r.ResponseStatusCode != nil {
 			c := *r.ResponseStatusCode
 			switch {
@@ -127,10 +134,16 @@ func computeRequestStats(reqs []api.ServerlessRequestLog) requestStats {
 				s.ClientErr++
 			case c >= 500:
 				s.ServerErr++
+				isErr = true
 			}
 		}
 		if strings.EqualFold(r.Status, "error") || strings.EqualFold(r.Status, "failed") || r.ErrorMessage != "" {
 			s.Errored++
+			isErr = true
+		}
+		// Count each failed request once so the rate can't exceed 100%.
+		if isErr {
+			s.Errors++
 		}
 		if r.DurationMS != nil {
 			s.durations = append(s.durations, *r.DurationMS)
@@ -147,7 +160,7 @@ func computeRequestStats(reqs []api.ServerlessRequestLog) requestStats {
 		s.P95MS = sorted[int(float64(len(sorted)-1)*0.95)]
 	}
 	if s.Total > 0 {
-		s.ErrorRate = float64(s.ServerErr+s.Errored) / float64(s.Total) * 100
+		s.ErrorRate = float64(s.Errors) / float64(s.Total) * 100
 	}
 	return s
 }
@@ -171,13 +184,20 @@ func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingL
 		return s
 	}
 	s.WindowCount = len(page.Data)
-	for i, log := range page.Data {
-		if i == 0 {
+	var lastEventTime, lastErrorTime time.Time
+	var dirs []int // scale directions in chronological order: +1 up, -1 down
+	// The API returns newest-first; walk in reverse to get chronological order.
+	for i := len(page.Data) - 1; i >= 0; i-- {
+		log := page.Data[i]
+		t, _ := output.ParseTimestamp(log.CreatedAt)
+		if !t.IsZero() && (lastEventTime.IsZero() || t.After(lastEventTime)) {
+			lastEventTime = t
 			s.LastEvent = log.Event
 		}
 		if strings.EqualFold(log.Level, "error") {
 			s.Errors++
-			if s.LastError == "" {
+			if !t.IsZero() && (lastErrorTime.IsZero() || t.After(lastErrorTime)) {
+				lastErrorTime = t
 				s.LastError = log.CreatedAt
 			}
 		}
@@ -185,12 +205,16 @@ func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingL
 		switch {
 		case log.CurrentReplicas != nil && log.DesiredReplicas != nil && *log.DesiredReplicas > *log.CurrentReplicas:
 			s.ScaleUps++
+			dirs = append(dirs, 1)
 		case log.CurrentReplicas != nil && log.DesiredReplicas != nil && *log.DesiredReplicas < *log.CurrentReplicas:
 			s.ScaleDowns++
+			dirs = append(dirs, -1)
 		case strings.Contains(blob, "scale up") || strings.Contains(blob, "scale_up") || strings.Contains(blob, "scaled up"):
 			s.ScaleUps++
+			dirs = append(dirs, 1)
 		case strings.Contains(blob, "scale down") || strings.Contains(blob, "scale_down") || strings.Contains(blob, "scaled down"):
 			s.ScaleDowns++
+			dirs = append(dirs, -1)
 		}
 		if strings.Contains(blob, "idle") {
 			s.IdleTeardown++
@@ -202,7 +226,15 @@ func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingL
 			s.ColdStarts++
 		}
 	}
-	s.PingPong = s.ScaleUps >= 3 && s.ScaleDowns >= 3
+	// Ping-pong = actual back-and-forth, not just high counts (which slow cold
+	// starts can inflate). Require several direction reversals.
+	transitions := 0
+	for i := 1; i < len(dirs); i++ {
+		if dirs[i] != dirs[i-1] {
+			transitions++
+		}
+	}
+	s.PingPong = transitions >= 4
 	return s
 }
 
@@ -246,8 +278,11 @@ func scanReplicaIssues(client *api.Client, replicas []api.ServerlessReplica) []l
 	return out
 }
 
-func healthVerdict(stats requestStats, svc api.ServerlessService, issues []logIssue) string {
+func healthVerdict(stats requestStats, svc api.ServerlessService, issues []logIssue, fetchOK bool) string {
 	switch {
+	case !fetchOK && stats.Total == 0:
+		// Couldn't read request logs — don't claim healthy when we're blind.
+		return "unknown"
 	case stats.Total > 0 && stats.ErrorRate >= 20:
 		return "unhealthy"
 	case len(issues) > 0 || (stats.Total > 0 && stats.ErrorRate >= 5) || (svc.ActiveReplicasCount == 0 && svc.MinReplicas > 0):
@@ -262,7 +297,7 @@ func printHealth(svc api.ServerlessService, identifier, verdict string, stats re
 	switch verdict {
 	case "healthy":
 		verdictColored = output.Good(verdict)
-	case "degraded", "unhealthy":
+	case "degraded", "unhealthy", "unknown":
 		verdictColored = output.Warn(verdict)
 	}
 	fmt.Printf("Health:    %s  —  %s (%s)\n", verdictColored, svc.Name, shortID(identifier))

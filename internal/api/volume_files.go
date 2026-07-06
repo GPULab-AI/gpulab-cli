@@ -1,7 +1,8 @@
 package api
 
 import (
-	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -148,47 +149,74 @@ type UploadItem struct {
 // stored flat under destDir using its DestName (or basename). To place a file at
 // an arbitrary path, set destDir to the target directory and DestName to the
 // target filename.
+//
+// The multipart body is streamed through an io.Pipe so multi-GB files are never
+// buffered fully in memory.
 func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, items []UploadItem) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
 
-	if err := writer.WriteField("path", destDir); err != nil {
-		return nil, err
-	}
-
-	for _, item := range items {
-		file, err := os.Open(item.LocalPath)
+	go func() {
+		// Any error here is surfaced on the read side via CloseWithError, which
+		// makes the HTTP request fail with the same error.
+		err := func() error {
+			if err := writer.WriteField("path", destDir); err != nil {
+				return err
+			}
+			for _, item := range items {
+				file, err := os.Open(item.LocalPath)
+				if err != nil {
+					return fmt.Errorf("failed to open %s: %w", item.LocalPath, err)
+				}
+				name := item.DestName
+				if name == "" {
+					name = filepath.Base(item.LocalPath)
+				}
+				part, err := writer.CreateFormFile("files[]", name)
+				if err != nil {
+					file.Close()
+					return err
+				}
+				if _, err := io.Copy(part, file); err != nil {
+					file.Close()
+					return err
+				}
+				file.Close()
+				// Flat upload: system-server stores each by its multipart filename.
+				if err := writer.WriteField("relative_paths[]", ""); err != nil {
+					return err
+				}
+			}
+			return writer.Close()
+		}()
 		if err != nil {
-			return nil, fmt.Errorf("failed to open %s: %w", item.LocalPath, err)
+			pw.CloseWithError(err)
+			return
 		}
+		pw.Close()
+	}()
 
-		name := item.DestName
-		if name == "" {
-			name = filepath.Base(item.LocalPath)
-		}
-		part, err := writer.CreateFormFile("files[]", name)
-		if err != nil {
-			file.Close()
-			return nil, err
-		}
-		if _, err := io.Copy(part, file); err != nil {
-			file.Close()
-			return nil, err
-		}
-		file.Close()
+	return c.PostStream(c.volumeFilesPath(volumeUUID, "/upload"), writer.FormDataContentType(), pr)
+}
 
-		// Flat upload: keep files at the destination root (system-server stores
-		// each by its multipart filename).
-		if err := writer.WriteField("relative_paths[]", ""); err != nil {
-			return nil, err
+// HashVolumeFile streams a file from the volume and returns its sha256 and size
+// without buffering it in memory. found=false (nil error) for a missing file.
+func (c *Client) HashVolumeFile(volumeUUID, path string) (sum string, size int64, found bool, err error) {
+	resp, err := c.GetStream(c.volumeFilesPath(volumeUUID, "/download") + "?path=" + url.QueryEscape(path))
+	if err != nil {
+		if IsNotFound(err) {
+			return "", 0, false, nil
 		}
+		return "", 0, false, err
 	}
+	defer resp.Body.Close()
 
-	if err := writer.Close(); err != nil {
-		return nil, err
+	h := sha256.New()
+	n, err := io.Copy(h, resp.Body)
+	if err != nil {
+		return "", 0, false, err
 	}
-
-	return c.doRaw("POST", c.volumeFilesPath(volumeUUID, "/upload"), writer.FormDataContentType(), &buf)
+	return hex.EncodeToString(h.Sum(nil)), n, true, nil
 }
 
 // UploadLocalFiles is a convenience wrapper for uploading files by path using
