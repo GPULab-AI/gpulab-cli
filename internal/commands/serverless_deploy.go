@@ -2,10 +2,7 @@ package commands
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -131,17 +128,8 @@ Examples:
 		if !deployNoVerify {
 			steps.begin("Verifying uploads are byte-identical")
 			for _, it := range plan {
-				localSum, err := sha256File(it.Local)
-				if err != nil {
-					return err
-				}
-				remoteBytes, err := client.DownloadVolumeFile(svc.NetworkVolumeUUID, it.Remote)
-				if err != nil {
-					return fmt.Errorf("verify: cannot re-download %s: %w", it.Remote, err)
-				}
-				sum := sha256.Sum256(remoteBytes)
-				if hex.EncodeToString(sum[:]) != localSum {
-					return fmt.Errorf("verify FAILED for %s: uploaded bytes differ from local — aborting before restart", it.Remote)
+				if err := verifyReadback(client, svc.NetworkVolumeUUID, it.Remote, it.Local); err != nil {
+					return fmt.Errorf("%w — aborting before restart", err)
 				}
 			}
 			steps.ok("all %d file(s) byte-identical", len(plan))
@@ -163,7 +151,25 @@ Examples:
 			restarted = len(detail.Replicas)
 		}
 
-		// Step 4: smoke test the health path.
+		// Step 4: prove the restart actually recycled the replicas onto the new
+		// code. A liveness smoke test alone can't catch a restart that didn't
+		// reload code, so we re-check staleness: every running replica must have
+		// started after the code we just deployed.
+		var recycleErr error
+		if restarted > 0 && !deployNoVerify && svc.NetworkVolumeUUID != "" {
+			steps.begin("Verifying replicas recycled onto the new code")
+			stuck, err := assertReplicasRecycled(client, identifier, svc.NetworkVolumeUUID, deployCodePath(plan), slDeployWait)
+			if err != nil {
+				steps.fail("could not confirm recycle: %v", err)
+			} else if len(stuck) > 0 {
+				recycleErr = fmt.Errorf("replicas did not reload the new code (still predate it): %s", strings.Join(stuck, ", "))
+				steps.fail("%v", recycleErr)
+			} else {
+				steps.ok("all running replicas started after the deployed code")
+			}
+		}
+
+		// Step 5: smoke test the health path.
 		smokeCode := 0
 		var smokeErr error
 		healthPath := firstNonEmpty(deployHealth, svc.HealthCheckPath, "/")
@@ -177,6 +183,11 @@ Examples:
 			}
 		}
 
+		overallErr := recycleErr
+		if overallErr == nil {
+			overallErr = smokeErr
+		}
+
 		if flagJSON {
 			output.PrintJSON(map[string]interface{}{
 				"endpoint":     identifier,
@@ -184,10 +195,14 @@ Examples:
 				"files":        len(plan),
 				"verified":     !deployNoVerify,
 				"replicas":     restarted,
+				"recycled":     recycleErr == nil,
 				"smoke_status": smokeCode,
 				"smoke_ok":     smokeErr == nil,
-				"status":       boolStatus(smokeErr == nil, "success", "smoke_failed"),
+				"status":       boolStatus(overallErr == nil, "success", "failed"),
 			})
+		}
+		if recycleErr != nil {
+			return fmt.Errorf("deploy: %w", recycleErr)
 		}
 		if smokeErr != nil {
 			return fmt.Errorf("deploy applied but smoke test failed: %w", smokeErr)
@@ -199,6 +214,64 @@ Examples:
 	},
 }
 
+// assertReplicasRecycled waits for running replicas to come up after a restart
+// and returns the UUIDs of any that still predate the volume's newest code file
+// (i.e. the restart did not reload the new code). An empty result means all
+// running replicas are on the new code.
+func assertReplicasRecycled(client *api.Client, identifier, volumeUUID, codePath string, timeoutSecs int) ([]string, error) {
+	deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
+	for {
+		detail, err := client.GetServerlessService(identifier)
+		if err != nil {
+			return nil, err
+		}
+		running := runningReplicas(detail.Replicas)
+		if len(running) > 0 {
+			stale, err := computeReplicaStaleness(client, volumeUUID, codePath, running, 2)
+			if err != nil {
+				return nil, err
+			}
+			var stuck []string
+			for _, r := range running {
+				if res := stale[r.UUID]; res != nil && res.Stale {
+					stuck = append(stuck, shortID(r.UUID))
+				}
+			}
+			return stuck, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("no running replicas came up within %ds", timeoutSecs)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func runningReplicas(replicas []api.ServerlessReplica) []api.ServerlessReplica {
+	var out []api.ServerlessReplica
+	for _, r := range replicas {
+		switch strings.ToLower(r.Status) {
+		case "running", "healthy", "unhealthy":
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// deployCodePath returns the common destination directory of the plan (used to
+// scope the recycle staleness check), or "" if the files span directories.
+func deployCodePath(plan []deployPlanItem) string {
+	if len(plan) == 0 {
+		return ""
+	}
+	dir := plan[0].Dir
+	for _, it := range plan[1:] {
+		if it.Dir != dir {
+			return ""
+		}
+	}
+	return dir
+}
+
 func buildDeployPlan(locals []string) ([]deployPlanItem, error) {
 	var plan []deployPlanItem
 	if deployTo != "" {
@@ -206,6 +279,17 @@ func buildDeployPlan(locals []string) ([]deployPlanItem, error) {
 			return nil, fmt.Errorf("--to takes a single local file (got %d)", len(locals))
 		}
 		to := strings.TrimLeft(deployTo, "/")
+		if strings.HasSuffix(to, "/") {
+			// A trailing slash means "into this directory" — keep the local name.
+			dir := strings.TrimRight(to, "/")
+			name := filepath.Base(locals[0])
+			remote := name
+			if dir != "" {
+				remote = dir + "/" + name
+			}
+			plan = append(plan, deployPlanItem{Local: locals[0], Remote: remote, Dir: dir, Name: name})
+			return plan, nil
+		}
 		plan = append(plan, deployPlanItem{Local: locals[0], Remote: to, Dir: baseDir(to), Name: baseName(to)})
 		return plan, nil
 	}
@@ -219,19 +303,6 @@ func buildDeployPlan(locals []string) ([]deployPlanItem, error) {
 		plan = append(plan, deployPlanItem{Local: p, Remote: remote, Dir: dir, Name: name})
 	}
 	return plan, nil
-}
-
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // smokeTestEndpoint issues GET requests to the endpoint's health path until it

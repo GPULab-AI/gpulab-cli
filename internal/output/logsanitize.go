@@ -53,8 +53,10 @@ func demuxDockerStream(data []byte) ([]byte, bool) {
 }
 
 // looksLikeFrameHeader reports whether data starts with a Docker stream frame
-// header. Plain text starts with a printable byte (>= 0x20) or newline, so it
-// never matches; only the 0/1/2 stream markers with a zeroed high length do.
+// header, validating the framing rather than assuming a small (<64 KiB) frame:
+// it checks that the first frame's length lands exactly on EOF or on another
+// valid header. Plain text starts with a printable byte (>= 0x20) or newline,
+// so it fails the stream-marker check immediately.
 func looksLikeFrameHeader(data []byte) bool {
 	if len(data) < 8 {
 		return false
@@ -62,9 +64,17 @@ func looksLikeFrameHeader(data []byte) bool {
 	if data[0] > 2 || data[1] != 0 || data[2] != 0 || data[3] != 0 {
 		return false
 	}
-	// The two high bytes of the length are almost always zero for real frames;
-	// requiring it rules out coincidental control-char prefixes in text.
-	return data[4] == 0 && data[5] == 0
+	n := int(binary.BigEndian.Uint32(data[4:8]))
+	next := 8 + n
+	if next == len(data) {
+		return true // exactly one frame fills the buffer
+	}
+	if next >= 8 && next+8 <= len(data) {
+		// There is room for another frame; require a valid next header. This
+		// works for frames of any size (no 64 KiB cap).
+		return data[next] <= 2 && data[next+1] == 0 && data[next+2] == 0 && data[next+3] == 0
+	}
+	return false
 }
 
 // stripControlBytes removes non-printable bytes that make logs unreadable and

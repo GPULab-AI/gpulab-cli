@@ -17,6 +17,7 @@ import (
 type staleResult struct {
 	Checked    bool
 	Stale      bool
+	Unknown    bool // could not determine (unparseable time or no code file found)
 	NewestFile string
 	NewestTime time.Time
 }
@@ -89,7 +90,11 @@ func computeReplicaStaleness(client *api.Client, volumeUUID, codePath string, re
 	out := make(map[string]*staleResult, len(replicas))
 	for _, r := range replicas {
 		res := &staleResult{Checked: true, NewestFile: newestFile, NewestTime: newest}
-		if t, ok := output.ParseTimestamp(r.CreatedAt); ok && !newest.IsZero() {
+		t, ok := output.ParseTimestamp(r.CreatedAt)
+		if !ok || newest.IsZero() {
+			// Can't compare — don't claim "fresh" when we simply don't know.
+			res.Unknown = true
+		} else {
 			res.Stale = t.Before(newest)
 		}
 		out[r.UUID] = res

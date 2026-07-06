@@ -58,8 +58,13 @@ func parseTimestamp(value string) (time.Time, bool) {
 			return t, true
 		}
 	}
-	if secs, err := strconv.ParseInt(value, 10, 64); err == nil && secs > 0 {
-		return time.Unix(secs, 0), true
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
+		// 13+ digit values are millisecond epochs (seconds epochs are 10 digits
+		// through the year 2286); treat them as ms so they don't land in ~58500.
+		if n >= 1_000_000_000_000 {
+			return time.UnixMilli(n), true
+		}
+		return time.Unix(n, 0), true
 	}
 	return time.Time{}, false
 }

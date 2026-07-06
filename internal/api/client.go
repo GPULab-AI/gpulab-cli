@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -157,8 +158,59 @@ func (c *Client) doRaw(method, path, contentType string, body io.Reader) ([]byte
 	return respBody, nil
 }
 
+// GetStream issues a GET and returns the raw response for streaming (the caller
+// must close the body). Non-2xx responses are turned into an *APIError with the
+// body read, so large downloads are never buffered on the success path.
+func (c *Client) GetStream(path string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", c.BaseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("api-key", c.APIKey)
+	req.Header.Set("Accept", "application/octet-stream")
+
+	if c.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] GET %s (stream)\n", c.BaseURL+path)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var errResp struct {
+			Message string `json:"message"`
+			Error   string `json:"error"`
+		}
+		json.Unmarshal(body, &errResp)
+		message := errResp.Message
+		if message == "" {
+			message = errResp.Error
+		}
+		return nil, &APIError{StatusCode: resp.StatusCode, Message: message, Body: string(body)}
+	}
+	return resp, nil
+}
+
+// PostStream posts a streaming body (e.g. a multipart upload built lazily) and
+// reads the (small) response fully.
+func (c *Client) PostStream(path, contentType string, body io.Reader) ([]byte, error) {
+	return c.doRaw("POST", path, contentType, body)
+}
+
 func (c *Client) Get(path string) ([]byte, error) {
 	return c.do("GET", path, nil)
+}
+
+// IsNotFound reports whether err is an API 404.
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == 404
+	}
+	return false
 }
 
 func (c *Client) Post(path string, body interface{}) ([]byte, error) {

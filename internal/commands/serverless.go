@@ -1405,7 +1405,12 @@ func enrichReplicasWithStale(replicas []api.ServerlessReplica, stale map[string]
 	for i, r := range replicas {
 		m := enrichReplica(r)
 		if res, ok := stale[r.UUID]; ok && res != nil && res.Checked {
-			m["stale"] = res.Stale
+			if res.Unknown {
+				m["stale"] = nil
+				m["stale_unknown"] = true
+			} else {
+				m["stale"] = res.Stale
+			}
 			m["volume_newest_file"] = res.NewestFile
 			if !res.NewestTime.IsZero() {
 				m["volume_newest_mtime"] = res.NewestTime.UTC().Format(time.RFC3339)
@@ -1447,8 +1452,12 @@ func printServerlessReplicas(replicas []api.ServerlessReplica, stale map[string]
 	output.PrintTable(headers, rows)
 
 	if stale != nil {
-		if sample := firstStaleResult(stale); sample != nil && sample.Checked && !sample.NewestTime.IsZero() {
-			fmt.Printf("Volume newest file: %s (%s)\n", sample.NewestFile, shortTime(sample.NewestTime.Format(time.RFC3339)))
+		if sample := firstStaleResult(stale); sample != nil && sample.Checked {
+			if sample.NewestTime.IsZero() {
+				fmt.Printf("Volume newest file: %s\n", output.Warn("could not determine (no comparable code file found) — staleness unknown"))
+			} else {
+				fmt.Printf("Volume newest file: %s (%s)\n", sample.NewestFile, shortTime(sample.NewestTime.Format(time.RFC3339)))
+			}
 		}
 	}
 }
@@ -1458,6 +1467,9 @@ func printServerlessReplicas(replicas []api.ServerlessReplica, stale map[string]
 func staleCell(res *staleResult) string {
 	if res == nil || !res.Checked {
 		return "-"
+	}
+	if res.Unknown {
+		return output.Warn("? unknown")
 	}
 	if res.Stale {
 		return output.Warn("⚠ stale")

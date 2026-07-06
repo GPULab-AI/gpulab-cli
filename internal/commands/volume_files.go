@@ -207,10 +207,16 @@ Examples:
 			if len(locals) != 1 {
 				return fmt.Errorf("--to takes a single local file (got %d)", len(locals))
 			}
-			// --to is a full path inside the volume: split into dir + filename.
 			to := strings.TrimLeft(filesUploadTo, "/")
-			destDir = strings.TrimSuffix(baseDir(to), "/")
-			items = []api.UploadItem{{LocalPath: locals[0], DestName: baseName(to)}}
+			if strings.HasSuffix(to, "/") {
+				// Trailing slash: treat --to as a directory, keep the local name.
+				destDir = strings.TrimRight(to, "/")
+				items = []api.UploadItem{{LocalPath: locals[0], DestName: baseName(locals[0])}}
+			} else {
+				// --to is a full path inside the volume: split into dir + filename.
+				destDir = strings.TrimSuffix(baseDir(to), "/")
+				items = []api.UploadItem{{LocalPath: locals[0], DestName: baseName(to)}}
+			}
 		} else {
 			for _, p := range locals {
 				items = append(items, api.UploadItem{LocalPath: p})

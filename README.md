@@ -218,12 +218,19 @@ gpulab serverless list --volume my-volume
 ### Syncing a directory to a volume
 
 ```bash
-# rsync-style: uploads only new/changed files, previews the diff, and warns how
-# many endpoints/replicas use the volume (they keep old code until restarted).
+# rsync-style: uploads only new/changed files (compared by content hash, so
+# equal-length edits are caught), hash-verifies each upload, previews the diff,
+# and warns how many endpoints/replicas use the volume (they keep old code until
+# restarted).
 gpulab volumes sync ./server my-volume server --dry-run   # preview only
 gpulab volumes sync ./server my-volume server             # upload changes
+gpulab volumes sync ./server my-volume server --size-only # faster, size-only compare
 gpulab volumes files upload my-volume ./local.py --to server/tasks.py  # single file, renamed
 ```
+
+> `volumes sync --delete` refuses to run against an empty local dir (would wipe
+> the volume) unless you pass `--allow-empty`, and `--json`/non-interactive runs
+> won't mutate the volume without `--yes`.
 
 ## Templates (Docker images)
 
