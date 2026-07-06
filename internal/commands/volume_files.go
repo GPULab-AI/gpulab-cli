@@ -14,6 +14,7 @@ import (
 
 var (
 	filesUploadDest  string
+	filesUploadTo    string
 	filesWriteValue  string
 	filesWriteFile   string
 	filesDownloadOut string
@@ -35,6 +36,7 @@ func init() {
 	volumesFilesCmd.AddCommand(filesSearchCmd)
 
 	filesUploadCmd.Flags().StringVar(&filesUploadDest, "dest", "", "Destination directory inside the volume (default: root)")
+	filesUploadCmd.Flags().StringVar(&filesUploadTo, "to", "", "Destination path inside the volume for a single file (overrides the local basename, e.g. server/tasks.py)")
 	filesWriteCmd.Flags().StringVar(&filesWriteValue, "content", "", "File content (inline)")
 	filesWriteCmd.Flags().StringVar(&filesWriteFile, "from-file", "", "Read content from a local file ('-' for stdin)")
 	filesDownloadCmd.Flags().StringVarP(&filesDownloadOut, "output", "o", "", "Local output path (default: file basename, '-' for stdout)")
@@ -169,8 +171,19 @@ var filesDownloadCmd = &cobra.Command{
 var filesUploadCmd = &cobra.Command{
 	Use:     "upload [VOLUME] [LOCAL_FILE...]",
 	Aliases: []string{"put"},
-	Short:   "Upload local files to a volume directory",
-	Args:    cobra.MinimumNArgs(2),
+	Short:   "Upload local files to a volume",
+	Long: `Upload one or more local files to a network volume.
+
+By default files land in --dest (the volume root if unset) under their local
+basename. For a single file, --to <path> stores it at an explicit path inside
+the volume (directory + filename), which is what you want when the volume
+expects a specific name (e.g. server/tasks.py) regardless of the local filename.
+
+Examples:
+  gpulab volumes files upload my-vol ./model.bin --dest models
+  gpulab volumes files upload my-vol a.py b.py --dest server
+  gpulab volumes files upload my-vol ./local-name.py --to server/tasks.py`,
+	Args: cobra.MinimumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := requireAuth().WithTimeout(10 * time.Minute)
 		uuid, err := client.ResolveVolumeUUID(args[0])
@@ -184,10 +197,27 @@ var filesUploadCmd = &cobra.Command{
 				return fmt.Errorf("cannot upload %s: %w", p, statErr)
 			}
 			if info.IsDir() {
-				return fmt.Errorf("cannot upload %s: directories are not supported (zip and use extract)", p)
+				return fmt.Errorf("cannot upload %s: directories are not supported (use 'gpulab volumes sync %s <volume>' instead)", p, p)
 			}
 		}
-		resp, err := client.UploadVolumeFiles(uuid, filesUploadDest, locals)
+
+		destDir := filesUploadDest
+		var items []api.UploadItem
+		if filesUploadTo != "" {
+			if len(locals) != 1 {
+				return fmt.Errorf("--to takes a single local file (got %d)", len(locals))
+			}
+			// --to is a full path inside the volume: split into dir + filename.
+			to := strings.TrimLeft(filesUploadTo, "/")
+			destDir = strings.TrimSuffix(baseDir(to), "/")
+			items = []api.UploadItem{{LocalPath: locals[0], DestName: baseName(to)}}
+		} else {
+			for _, p := range locals {
+				items = append(items, api.UploadItem{LocalPath: p})
+			}
+		}
+
+		resp, err := client.UploadVolumeFiles(uuid, destDir, items)
 		if err != nil {
 			return err
 		}
@@ -196,11 +226,15 @@ var filesUploadCmd = &cobra.Command{
 			fmt.Println()
 			return nil
 		}
-		dest := filesUploadDest
-		if dest == "" {
-			dest = "/"
+		if filesUploadTo != "" {
+			output.PrintSuccess(fmt.Sprintf("Uploaded %s -> %s", locals[0], filesUploadTo))
+		} else {
+			dest := destDir
+			if dest == "" {
+				dest = "/"
+			}
+			output.PrintSuccess(fmt.Sprintf("Uploaded %d file(s) to %s", len(locals), dest))
 		}
-		output.PrintSuccess(fmt.Sprintf("Uploaded %d file(s) to %s", len(locals), dest))
 		return nil
 	},
 }
@@ -407,4 +441,14 @@ func baseName(p string) string {
 		return p[idx+1:]
 	}
 	return p
+}
+
+// baseDir returns the directory portion of a forward-slash volume path ("" for
+// a bare filename).
+func baseDir(p string) string {
+	p = strings.TrimRight(p, "/")
+	if idx := strings.LastIndex(p, "/"); idx >= 0 {
+		return p[:idx]
+	}
+	return ""
 }

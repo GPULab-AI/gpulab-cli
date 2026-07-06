@@ -137,8 +137,18 @@ func (c *Client) DownloadVolumeFile(volumeUUID, path string) ([]byte, error) {
 	return c.Get(c.volumeFilesPath(volumeUUID, "/download") + "?path=" + url.QueryEscape(path))
 }
 
-// UploadVolumeFiles uploads one or more local files into destDir on the volume.
-func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, localPaths []string) ([]byte, error) {
+// UploadItem is a single file to upload. DestName overrides the stored filename
+// (default: the local basename), letting callers rename on upload.
+type UploadItem struct {
+	LocalPath string
+	DestName  string
+}
+
+// UploadVolumeFiles uploads local files into destDir on the volume. Each file is
+// stored flat under destDir using its DestName (or basename). To place a file at
+// an arbitrary path, set destDir to the target directory and DestName to the
+// target filename.
+func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, items []UploadItem) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
@@ -146,13 +156,17 @@ func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, localPaths []stri
 		return nil, err
 	}
 
-	for _, localPath := range localPaths {
-		file, err := os.Open(localPath)
+	for _, item := range items {
+		file, err := os.Open(item.LocalPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open %s: %w", localPath, err)
+			return nil, fmt.Errorf("failed to open %s: %w", item.LocalPath, err)
 		}
 
-		part, err := writer.CreateFormFile("files[]", filepath.Base(localPath))
+		name := item.DestName
+		if name == "" {
+			name = filepath.Base(item.LocalPath)
+		}
+		part, err := writer.CreateFormFile("files[]", name)
 		if err != nil {
 			file.Close()
 			return nil, err
@@ -163,7 +177,8 @@ func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, localPaths []stri
 		}
 		file.Close()
 
-		// Flat upload: keep files at the destination root.
+		// Flat upload: keep files at the destination root (system-server stores
+		// each by its multipart filename).
 		if err := writer.WriteField("relative_paths[]", ""); err != nil {
 			return nil, err
 		}
@@ -174,4 +189,14 @@ func (c *Client) UploadVolumeFiles(volumeUUID, destDir string, localPaths []stri
 	}
 
 	return c.doRaw("POST", c.volumeFilesPath(volumeUUID, "/upload"), writer.FormDataContentType(), &buf)
+}
+
+// UploadLocalFiles is a convenience wrapper for uploading files by path using
+// their basenames.
+func (c *Client) UploadLocalFiles(volumeUUID, destDir string, localPaths []string) ([]byte, error) {
+	items := make([]UploadItem, len(localPaths))
+	for i, p := range localPaths {
+		items[i] = UploadItem{LocalPath: p}
+	}
+	return c.UploadVolumeFiles(volumeUUID, destDir, items)
 }

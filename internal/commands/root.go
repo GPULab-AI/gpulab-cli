@@ -20,6 +20,7 @@ var (
 	flagAPIKey string
 	flagAPIURL string
 	flagDebug  bool
+	flagTZ     string
 )
 
 func SetVersionInfo(version, commit, date string) {
@@ -47,6 +48,7 @@ Output modes (use these for scripting and AI agents):
   --json     emit structured JSON instead of tables
   --quiet/-q print only IDs, one per line
   --debug    log every HTTP request/response to stderr
+  --tz       render timestamps in utc (default), local, or an IANA zone
 
 Common commands:
   gpulab ps                          list containers
@@ -59,6 +61,11 @@ Common commands:
   gpulab serverless logs my-endpoint --follow`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	// Apply cross-cutting flags before any command runs. No subcommand defines
+	// its own PersistentPreRunE, so this executes for every command.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return output.SetTimezone(flagTZ)
+	},
 }
 
 func Execute() {
@@ -74,6 +81,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API key (overrides config/env)")
 	rootCmd.PersistentFlags().StringVar(&flagAPIURL, "api-url", "", "API base URL (overrides config/env)")
 	rootCmd.PersistentFlags().BoolVar(&flagDebug, "debug", false, "Enable debug output")
+	rootCmd.PersistentFlags().StringVar(&flagTZ, "tz", "utc", "Timezone for timestamps: utc, local, or an IANA name (e.g. Asia/Kolkata)")
 }
 
 func getOutputFormat() output.Format {

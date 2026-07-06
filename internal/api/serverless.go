@@ -397,8 +397,11 @@ type ServerlessReplicaActionResponse struct {
 	ReplacementProvisioned bool   `json:"replacement_provisioned"`
 }
 
-func (c *Client) RestartServerlessReplica(identifier, replicaUUID string) (*ServerlessReplicaActionResponse, error) {
+func (c *Client) RestartServerlessReplica(identifier, replicaUUID string, drain bool) (*ServerlessReplicaActionResponse, error) {
 	path := "/v1/serverless/" + url.PathEscape(identifier) + "/replicas/" + url.PathEscape(replicaUUID) + "/restart"
+	if drain {
+		path += "?drain=true"
+	}
 	data, err := c.Post(path, nil)
 	if err != nil {
 		return nil, err
@@ -410,8 +413,11 @@ func (c *Client) RestartServerlessReplica(identifier, replicaUUID string) (*Serv
 	return &resp, nil
 }
 
-func (c *Client) DeleteServerlessReplica(identifier, replicaUUID string) error {
+func (c *Client) DeleteServerlessReplica(identifier, replicaUUID string, drain bool) error {
 	path := "/v1/serverless/" + url.PathEscape(identifier) + "/replicas/" + url.PathEscape(replicaUUID)
+	if drain {
+		path += "?drain=true"
+	}
 	_, err := c.Delete(path)
 	return err
 }

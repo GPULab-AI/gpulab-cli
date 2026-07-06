@@ -14,6 +14,7 @@ var (
 	logsDeploy     bool
 	logsTimestamps bool
 	logsSince      string
+	logsGrep       string
 )
 
 func init() {
@@ -21,7 +22,8 @@ func init() {
 	logsCmd.Flags().IntVarP(&logsTail, "tail", "n", 100, "Number of lines from the end (0 = all)")
 	logsCmd.Flags().BoolVar(&logsDeploy, "deploy", false, "Show deployment logs instead of runtime logs")
 	logsCmd.Flags().BoolVarP(&logsTimestamps, "timestamps", "t", false, "Prefix each line with a timestamp")
-	logsCmd.Flags().StringVar(&logsSince, "since", "", "Only show logs since a Unix timestamp or relative time (e.g. 10m, 1h)")
+	logsCmd.Flags().StringVar(&logsSince, "since", "", "Only show logs since a relative time (10m, 1h, 2d) or Unix timestamp")
+	logsCmd.Flags().StringVar(&logsGrep, "grep", "", "Only show log lines matching this regular expression")
 
 	rootCmd.AddCommand(logsCmd)
 }
@@ -43,7 +45,12 @@ why a container failed to start, and --follow to stream new output live.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := requireAuth()
 
-		uuid, err := client.ResolveContainerUUID(args[0])
+		uuid, err := resolveContainerUUIDWithHint(client, args[0], serverlessLogsSuggestion)
+		if err != nil {
+			return err
+		}
+
+		sinceTS, err := output.ParseSince(logsSince)
 		if err != nil {
 			return err
 		}
@@ -51,6 +58,10 @@ why a container failed to start, and --follow to stream new output live.`,
 		if logsDeploy {
 			logs, err := client.GetDeploymentLogs(uuid)
 			if err != nil {
+				return err
+			}
+			logs = tailLines(logs, logsTail)
+			if logs, err = grepLogs(logs, logsGrep); err != nil {
 				return err
 			}
 			if flagJSON {
@@ -62,8 +73,11 @@ why a container failed to start, and --follow to stream new output live.`,
 		}
 
 		// Get runtime logs
-		logs, err := client.GetContainerLogs(uuid, logsTail, logsSince, logsTimestamps)
+		logs, err := client.GetContainerLogs(uuid, logsTail, sinceTS, logsTimestamps)
 		if err != nil {
+			return err
+		}
+		if logs, err = grepLogs(logs, logsGrep); err != nil {
 			return err
 		}
 
@@ -87,6 +101,9 @@ why a container failed to start, and --follow to stream new output live.`,
 					continue
 				}
 				since = next
+				if newLogs, err = grepLogs(newLogs, logsGrep); err != nil {
+					return err
+				}
 				printLogChunk(newLogs)
 			}
 		}
