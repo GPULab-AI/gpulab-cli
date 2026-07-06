@@ -171,6 +171,60 @@ gpulab serverless update llama-api --max-replicas 4 --autoscaling-template pendi
 gpulab serverless delete llama-api --force
 ```
 
+### Deploying code & debugging
+
+The serverless commands are built for closed-loop debugging. Logs are cleaned of
+Docker stream framing automatically (no more piping through `strings`), and all
+timestamps render in UTC by default (override with `--tz local` or `--tz Asia/Kolkata`).
+
+```bash
+# Atomic deploy: upload code → verify byte-identical → rolling restart → smoke test.
+# Replaces the manual upload-then-restart dance and prevents the stale-replica trap.
+gpulab serverless deploy llama-api ./tasks.py --to server/tasks.py --drain
+
+# One health surface: error rate, 4xx/5xx, latency, queue depth, cold starts,
+# scaling ping-pong, and (with --logs) detected tracebacks / CUDA OOM.
+gpulab serverless health llama-api --logs
+
+# Trace one request end to end: queued → started → completed, with the HTTP result.
+gpulab serverless trace <request-uuid>
+
+# Replicas with age, and a stale check: flags replicas started before the
+# volume's newest code file (⚠ running old code).
+gpulab serverless replicas llama-api --stale --code-path server
+
+# Restart: a single replica, all replicas, or a zero-downtime rolling restart.
+# --drain finishes in-flight requests before tearing each replica down.
+gpulab serverless restart llama-api <replica>          # one replica
+gpulab serverless restart llama-api --all --rolling    # rolling, no full outage
+gpulab serverless restart llama-api --all --drain      # graceful
+
+# Logs: fleet-wide, filtered, time-bounded, with traceback detection.
+gpulab serverless logs llama-api --replica all --since 10m --grep Traceback --detect
+
+# Which endpoints use a volume? (reverse lookup)
+gpulab volumes endpoints my-volume
+gpulab serverless list --volume my-volume
+```
+
+> **Note on reloading code.** `serverless restart` / `serverless deploy` reload
+> the latest volume code because they re-provision a fresh replica container. The
+> container-level `gpulab restart <uuid>` (and the `/restart` HTTP route) do **not**
+> reload code — the CLI detects when you point one at a serverless replica and
+> redirects you to `serverless restart`. A precise per-worker code fingerprint
+> (to catch a worker that kept old code in memory) needs the model image to report
+> its loaded version; until then, use `replicas --stale` as the practical signal.
+
+### Syncing a directory to a volume
+
+```bash
+# rsync-style: uploads only new/changed files, previews the diff, and warns how
+# many endpoints/replicas use the volume (they keep old code until restarted).
+gpulab volumes sync ./server my-volume server --dry-run   # preview only
+gpulab volumes sync ./server my-volume server             # upload changes
+gpulab volumes files upload my-volume ./local.py --to server/tasks.py  # single file, renamed
+```
+
 ## Templates (Docker images)
 
 Create and manage reusable container templates. Only `--name` and `--image` are
@@ -248,10 +302,18 @@ Passwords/tokens are write-only — they are never returned by `credentials list
 | `gpulab credentials rm <id>` | Delete a registry credential |
 | `gpulab gpus types` | List GPU types |
 | `gpulab volumes` | List volumes |
+| `gpulab volumes sync <dir> <volume> [remote]` | rsync-style sync a local dir to a volume |
+| `gpulab volumes endpoints <volume>` | List endpoints that use a volume (reverse lookup) |
+| `gpulab volumes files upload <volume> <file> --to <path>` | Upload a file, renamed |
 | `gpulab serverless` | Manage serverless GPU endpoints |
-| `gpulab serverless logs <endpoint>` | View serverless replica container logs |
+| `gpulab serverless deploy <endpoint> <file>` | Upload → verify → rolling restart → smoke test |
+| `gpulab serverless health <endpoint>` | Error rate, latency, queue, crashes, cold starts |
+| `gpulab serverless trace <request-uuid>` | Trace a request's lifecycle |
+| `gpulab serverless restart <endpoint> [replica\|--all]` | Restart replicas (rolling/drain) |
+| `gpulab serverless replicas <endpoint> --stale` | Replica ages + stale-code detection |
+| `gpulab serverless logs <endpoint>` | Replica logs (`--since`, `--grep`, `--detect`, `--replica all`) |
 | `gpulab serverless requests <endpoint>` | View serverless request logs |
-| `gpulab serverless autoscaling-logs <endpoint>` | View autoscaling history |
+| `gpulab serverless autoscaling-logs <endpoint>` | View autoscaling history + summary |
 | `gpulab update` | Update the CLI from GitHub Releases |
 
 ## Global Flags
@@ -262,6 +324,7 @@ Passwords/tokens are write-only — they are never returned by `credentials list
 | `-q, --quiet` | Quiet output (UUIDs only) |
 | `--api-key` | Override API key |
 | `--debug` | Debug mode (show HTTP requests) |
+| `--tz` | Timestamp timezone: `utc` (default), `local`, or an IANA name |
 
 ## Configuration
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+
+	"github.com/GPULab-AI/gpulab-cli/internal/output"
 )
 
 type Container struct {
@@ -190,7 +192,9 @@ func (c *Client) GetContainerLogs(uuid string, tail int, since string, timestamp
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return "", fmt.Errorf("failed to parse logs: %w", err)
 	}
-	return resp.Logs, nil
+	// Strip Docker stream framing / control bytes so logs are printable and
+	// greppable without piping through `strings`.
+	return output.SanitizeLogs(resp.Logs), nil
 }
 
 func (c *Client) GetDeploymentLogs(uuid string) (string, error) {
@@ -205,7 +209,7 @@ func (c *Client) GetDeploymentLogs(uuid string) (string, error) {
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return "", fmt.Errorf("failed to parse logs: %w", err)
 	}
-	return resp.Logs, nil
+	return output.SanitizeLogs(resp.Logs), nil
 }
 
 func (c *Client) GetContainerStats(uuid string) (*ContainerStats, error) {

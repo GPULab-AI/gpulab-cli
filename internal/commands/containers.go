@@ -188,7 +188,7 @@ func containerActionCmd(use, short, action string) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := requireAuth()
 
-			uuid, err := client.ResolveContainerUUID(args[0])
+			uuid, err := resolveContainerUUIDWithHint(client, args[0], serverlessRestartSuggestion)
 			if err != nil {
 				return err
 			}

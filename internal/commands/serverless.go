@@ -60,6 +60,9 @@ var (
 	serverlessFollowLogs       bool
 	serverlessLogTail          int
 	serverlessLogTimestamps    bool
+	serverlessLogSince         string
+	serverlessLogGrep          string
+	serverlessLogDetect        bool
 	serverlessInvokeMethod     string
 	serverlessInvokeData       string
 	serverlessInvokeDataFile   string
@@ -68,6 +71,15 @@ var (
 	serverlessInvokeTimeout    int
 	serverlessWatchStatus      bool
 	serverlessReplicaForce     bool
+	serverlessRestartAll       bool
+	serverlessRestartRolling   bool
+	serverlessRestartDrain     bool
+	serverlessRestartWait      int
+	serverlessReplicaDrain     bool
+	serverlessListVolume       string
+	serverlessReplicasStale    bool
+	serverlessStaleDepth       int
+	serverlessStaleCodePath    string
 )
 
 func init() {
@@ -80,7 +92,7 @@ func init() {
 	serverlessCmd.AddCommand(serverlessDeleteCmd)
 	serverlessCmd.AddCommand(serverlessOptionsCmd)
 	serverlessCmd.AddCommand(serverlessReplicasCmd)
-	serverlessCmd.AddCommand(serverlessRestartReplicaCmd)
+	serverlessCmd.AddCommand(serverlessRestartCmd)
 	serverlessCmd.AddCommand(serverlessDeleteReplicaCmd)
 	serverlessCmd.AddCommand(serverlessRequestsCmd)
 	serverlessCmd.AddCommand(serverlessAutoscalingLogsCmd)
@@ -92,6 +104,16 @@ func init() {
 
 	addServerlessWriteFlags(serverlessCreateCmd, true)
 	addServerlessWriteFlags(serverlessUpdateCmd, false)
+
+	serverlessListCmd.Flags().StringVar(&serverlessListVolume, "volume", "", "Only show endpoints using this network volume (UUID, name, or ID)")
+
+	serverlessReplicasCmd.Flags().BoolVar(&serverlessReplicasStale, "stale", false, "Flag replicas started before the volume's newest code file (running old code)")
+	serverlessReplicasCmd.Flags().IntVar(&serverlessStaleDepth, "depth", 2, "Directory depth to scan for the volume's newest file when --stale")
+	serverlessReplicasCmd.Flags().StringVar(&serverlessStaleCodePath, "code-path", "", "Scope the --stale scan to this volume subdirectory (e.g. server)")
+
+	// Reverse lookup lives under `volumes` for discoverability, but shares the
+	// serverless volume-matching logic defined here.
+	volumesCmd.AddCommand(volumesEndpointsCmd)
 
 	serverlessDeleteCmd.Flags().BoolVar(&serverlessForceDelete, "force", false, "Skip confirmation")
 
@@ -105,13 +127,22 @@ func init() {
 	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessAllPages, "all", false, "Fetch every page instead of just one")
 	serverlessAutoscalingLogsCmd.Flags().BoolVar(&serverlessDetails, "details", false, "Print metrics and context in human output")
 
+	serverlessRestartCmd.Flags().BoolVar(&serverlessRestartAll, "all", false, "Restart every replica")
+	serverlessRestartCmd.Flags().BoolVar(&serverlessRestartRolling, "rolling", false, "Restart one replica at a time, waiting for each replacement (needs min-replicas >= 1)")
+	serverlessRestartCmd.Flags().BoolVar(&serverlessRestartDrain, "drain", false, "Finish in-flight requests before tearing each replica down")
+	serverlessRestartCmd.Flags().IntVar(&serverlessRestartWait, "wait-timeout", 300, "Seconds to wait for each replacement replica when --rolling")
+
 	serverlessDeleteReplicaCmd.Flags().BoolVar(&serverlessReplicaForce, "force", false, "Skip confirmation")
+	serverlessDeleteReplicaCmd.Flags().BoolVar(&serverlessReplicaDrain, "drain", false, "Finish in-flight requests before tearing the replica down")
 
 	serverlessLogsCmd.Flags().StringVar(&serverlessReplica, "replica", "", "Replica UUID or prefix (default: first running replica, use 'all' for every replica)")
 	serverlessLogsCmd.Flags().BoolVar(&serverlessDeployLogs, "deploy", false, "Show deployment logs instead of runtime logs")
 	serverlessLogsCmd.Flags().BoolVarP(&serverlessFollowLogs, "follow", "f", false, "Follow logs")
 	serverlessLogsCmd.Flags().IntVarP(&serverlessLogTail, "tail", "n", 100, "Number of runtime log lines from the end")
 	serverlessLogsCmd.Flags().BoolVarP(&serverlessLogTimestamps, "timestamps", "t", false, "Show runtime log timestamps")
+	serverlessLogsCmd.Flags().StringVar(&serverlessLogSince, "since", "", "Only show logs since a relative time (10m, 1h, 2d) or Unix timestamp")
+	serverlessLogsCmd.Flags().StringVar(&serverlessLogGrep, "grep", "", "Only show log lines matching this regular expression")
+	serverlessLogsCmd.Flags().BoolVar(&serverlessLogDetect, "detect", false, "After the logs, summarize detected tracebacks/OOM/errors")
 
 	serverlessValidatePolicyCmd.Flags().StringVar(&serverlessAutoscalingTpl, "template", "", "Autoscaling template key")
 	serverlessValidatePolicyCmd.Flags().StringVar(&serverlessPolicy, "policy", "", "Autoscaling policy code")
@@ -185,7 +216,86 @@ var serverlessListCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if serverlessListVolume != "" {
+			services = filterServicesByVolume(services, serverlessListVolume)
+		}
 		printServerlessServices(services)
+		return nil
+	},
+}
+
+// serviceUsesVolume reports whether a serverless endpoint uses the given volume,
+// matched by UUID (exact or prefix), name (case-insensitive), or numeric ID.
+func serviceUsesVolume(service api.ServerlessService, selector string) bool {
+	if selector == "" {
+		return false
+	}
+	if service.NetworkVolumeUUID == selector ||
+		strings.HasPrefix(service.NetworkVolumeUUID, selector) ||
+		strings.EqualFold(service.NetworkVolumeName, selector) {
+		return true
+	}
+	if service.NetworkVolumeID != nil && strconv.Itoa(*service.NetworkVolumeID) == selector {
+		return true
+	}
+	return strings.Contains(strings.ToLower(service.NetworkVolumeName), strings.ToLower(selector))
+}
+
+func filterServicesByVolume(services []api.ServerlessService, selector string) []api.ServerlessService {
+	var out []api.ServerlessService
+	for _, service := range services {
+		if serviceUsesVolume(service, selector) {
+			out = append(out, service)
+		}
+	}
+	return out
+}
+
+// volumesEndpointsCmd answers "which serverless endpoints use volume X?".
+var volumesEndpointsCmd = &cobra.Command{
+	Use:     "endpoints [VOLUME]",
+	Aliases: []string{"used-by", "usage"},
+	Short:   "List serverless endpoints that use a network volume",
+	Long: `Reverse lookup: given a network volume, show every serverless endpoint that
+mounts it. VOLUME may be a full UUID, a UUID prefix, or the volume name.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := requireAuth()
+		selectors := []string{args[0]}
+		if uuid, err := client.ResolveVolumeUUID(args[0]); err == nil && uuid != args[0] {
+			selectors = append(selectors, uuid)
+		}
+
+		services, err := client.ListServerlessServices()
+		if err != nil {
+			return err
+		}
+		var matches []api.ServerlessService
+		for _, service := range services {
+			for _, sel := range selectors {
+				if serviceUsesVolume(service, sel) {
+					matches = append(matches, service)
+					break
+				}
+			}
+		}
+
+		switch getOutputFormat() {
+		case output.FormatJSON:
+			output.PrintJSON(matches)
+		case output.FormatQuiet:
+			ids := make([]string, len(matches))
+			for i, m := range matches {
+				ids[i] = m.UUID
+			}
+			output.PrintQuiet(ids)
+		default:
+			if len(matches) == 0 {
+				fmt.Printf("No serverless endpoints use volume %q.\n", args[0])
+				return nil
+			}
+			printServerlessServices(matches)
+		}
 		return nil
 	},
 }
@@ -335,49 +445,174 @@ var serverlessReplicasCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+
+		var stale map[string]*staleResult
+		if serverlessReplicasStale {
+			stale, err = computeReplicaStaleness(client, detail.Data.NetworkVolumeUUID, serverlessStaleCodePath, detail.Replicas, serverlessStaleDepth)
+			if err != nil {
+				return fmt.Errorf("stale check failed: %w", err)
+			}
+		}
+
 		if flagJSON {
-			output.PrintJSON(detail.Replicas)
+			output.PrintJSON(enrichReplicasWithStale(detail.Replicas, stale))
 			return nil
 		}
-		printServerlessReplicas(detail.Replicas)
+		printServerlessReplicas(detail.Replicas, stale)
 		return nil
 	},
 }
 
-var serverlessRestartReplicaCmd = &cobra.Command{
-	Use:   "restart-replica [ENDPOINT] [REPLICA]",
-	Short: "Restart a single replica (tears it down and re-provisions)",
-	Long: `Restart a single replica of a serverless endpoint.
+var serverlessRestartCmd = &cobra.Command{
+	Use:     "restart [ENDPOINT] [REPLICA]",
+	Aliases: []string{"restart-replica"},
+	Short:   "Restart serverless replicas (single, rolling, or all)",
+	Long: `Restart one or more replicas of a serverless endpoint.
 
-The replica is torn down and a fresh one is brought back up to the warm-pool
-minimum. For autoscaling endpoints the autoscaler reconciles on its next cycle.
+Each restart tears the replica down and brings a fresh one back up to the
+warm-pool minimum, so it reloads the latest volume code. (This is different from
+the container-level /restart, which does NOT reload code.) Pass a REPLICA to
+restart just that one, or --all to restart every replica. With --rolling the
+replicas are restarted one at a time, waiting for each replacement to come up
+before the next teardown, so there's no full outage when min-replicas >= 1.
+
 REPLICA may be a full UUID, a UUID prefix, or a server name (see 'serverless
 replicas <endpoint>').`,
-	Args: cobra.ExactArgs(2),
+	Args: cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := requireAuth()
 		identifier, err := client.ResolveServerlessService(args[0])
 		if err != nil {
 			return err
 		}
-		replicaUUID, err := resolveServerlessReplicaUUID(client, identifier, args[1])
+		detail, err := client.GetServerlessService(identifier)
 		if err != nil {
 			return err
 		}
-		resp, err := client.RestartServerlessReplica(identifier, replicaUUID)
-		if err != nil {
-			return err
+
+		var targets []api.ServerlessReplica
+		if serverlessRestartAll {
+			if len(args) == 2 {
+				return fmt.Errorf("pass either a REPLICA or --all, not both")
+			}
+			targets = detail.Replicas
+		} else {
+			if len(args) < 2 {
+				return fmt.Errorf("specify a replica to restart, or pass --all to restart every replica\n\n%s", replicaListHint(detail.Replicas))
+			}
+			replicaUUID, err := resolveServerlessReplicaUUID(client, identifier, args[1])
+			if err != nil {
+				return err
+			}
+			for _, r := range detail.Replicas {
+				if r.UUID == replicaUUID {
+					targets = append(targets, r)
+					break
+				}
+			}
 		}
-		if flagJSON {
-			output.PrintJSON(resp)
+
+		if len(targets) == 0 {
+			if flagJSON {
+				output.PrintJSON(map[string]interface{}{"endpoint": identifier, "restarted": []interface{}{}})
+				return nil
+			}
+			fmt.Println("No replicas to restart.")
 			return nil
 		}
-		output.PrintSuccess(fmt.Sprintf("Replica restarted: %s", shortID(replicaUUID)))
-		if resp.ReplacementProvisioned {
-			fmt.Println("A replacement replica is being provisioned.")
-		}
-		return nil
+
+		return restartServerlessReplicas(client, identifier, targets, detail.Data.MinReplicas, serverlessRestartRolling, serverlessRestartDrain, serverlessRestartWait)
 	},
+}
+
+// replicaListHint renders a short list of replicas for error messages.
+func replicaListHint(replicas []api.ServerlessReplica) string {
+	if len(replicas) == 0 {
+		return "This endpoint has no replicas right now."
+	}
+	var b strings.Builder
+	b.WriteString("replicas:\n")
+	for _, r := range replicas {
+		fmt.Fprintf(&b, "  %s  %s  %s\n", shortID(r.UUID), r.ServerName, r.Status)
+	}
+	return b.String()
+}
+
+// restartServerlessReplicas restarts the given replicas, optionally rolling
+// (waiting for each replacement to come up) and/or draining in-flight requests.
+func restartServerlessReplicas(client *api.Client, identifier string, targets []api.ServerlessReplica, minReplicas int, rolling, drain bool, waitTimeout int) error {
+	// Pre-compute the batch's UUIDs so rolling waits detect a genuinely new
+	// replacement replica rather than a sibling that is still up.
+	batch := make(map[string]bool, len(targets))
+	for _, r := range targets {
+		batch[r.UUID] = true
+	}
+
+	results := make([]map[string]interface{}, 0, len(targets))
+	for i, r := range targets {
+		if !flagJSON {
+			label := r.ServerName
+			if label == "" {
+				label = shortID(r.UUID)
+			}
+			fmt.Fprintf(os.Stderr, "Restarting replica %d/%d: %s (%s)...\n", i+1, len(targets), label, shortID(r.UUID))
+		}
+		resp, err := client.RestartServerlessReplica(identifier, r.UUID, drain)
+		if err != nil {
+			if flagJSON {
+				results = append(results, map[string]interface{}{"uuid": r.UUID, "status": "error", "error": err.Error()})
+				continue
+			}
+			return fmt.Errorf("failed to restart replica %s: %w", shortID(r.UUID), err)
+		}
+		results = append(results, map[string]interface{}{
+			"uuid":                    r.UUID,
+			"status":                  "restarted",
+			"replacement_provisioned": resp.ReplacementProvisioned,
+		})
+
+		// Roll: wait for a replacement before tearing down the next one. Only
+		// meaningful when the warm pool re-provisions (min-replicas >= 1).
+		if rolling && minReplicas > 0 && i < len(targets)-1 {
+			if !flagJSON {
+				fmt.Fprintf(os.Stderr, "  waiting for a replacement replica...\n")
+			}
+			if err := waitForNewRunningReplica(client, identifier, batch, waitTimeout); err != nil && !flagJSON {
+				fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
+			}
+		}
+	}
+
+	if flagJSON {
+		output.PrintJSON(map[string]interface{}{"endpoint": identifier, "restarted": results})
+		return nil
+	}
+	output.PrintSuccess(fmt.Sprintf("Restarted %d replica(s) of %s", len(targets), shortID(identifier)))
+	return nil
+}
+
+// waitForNewRunningReplica polls until a running replica appears whose UUID is
+// not in exclude (the restart batch), i.e. a freshly provisioned replacement.
+func waitForNewRunningReplica(client *api.Client, identifier string, exclude map[string]bool, timeoutSecs int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
+	for {
+		detail, err := client.GetServerlessService(identifier)
+		if err == nil {
+			for _, r := range detail.Replicas {
+				if exclude[r.UUID] {
+					continue
+				}
+				switch strings.ToLower(r.Status) {
+				case "running", "healthy":
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %ds waiting for a replacement replica", timeoutSecs)
+		}
+		time.Sleep(3 * time.Second)
+	}
 }
 
 var serverlessDeleteReplicaCmd = &cobra.Command{
@@ -404,7 +639,7 @@ var serverlessDeleteReplicaCmd = &cobra.Command{
 				return nil
 			}
 		}
-		if err := client.DeleteServerlessReplica(identifier, replicaUUID); err != nil {
+		if err := client.DeleteServerlessReplica(identifier, replicaUUID, serverlessReplicaDrain); err != nil {
 			return err
 		}
 		if flagJSON {
@@ -473,6 +708,7 @@ var serverlessAutoscalingLogsCmd = &cobra.Command{
 			output.PrintJSON(page)
 			return nil
 		}
+		printAutoscalingSummary(computeAutoscalingStats(page))
 		printServerlessAutoscalingLogs(page, serverlessDetails)
 		return nil
 	},
@@ -481,7 +717,20 @@ var serverlessAutoscalingLogsCmd = &cobra.Command{
 var serverlessLogsCmd = &cobra.Command{
 	Use:   "logs [ENDPOINT]",
 	Short: "Show serverless replica container logs",
-	Args:  cobra.ExactArgs(1),
+	Long: `Show container logs for a serverless endpoint's replicas.
+
+By default the first running replica is used. Pass --replica <uuid|prefix|name>
+to target a specific replica, or --replica all to aggregate every replica's
+logs (each block is prefixed with its replica). Logs are de-framed and cleaned
+automatically, so no piping through 'strings' is needed.
+
+Examples:
+  gpulab serverless logs my-endpoint                 # first running replica
+  gpulab serverless logs my-endpoint --replica all   # every replica
+  gpulab serverless logs my-endpoint --since 10m     # last 10 minutes
+  gpulab serverless logs my-endpoint --grep Traceback
+  gpulab serverless logs my-endpoint -f              # follow`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := requireAuth()
 		identifier, err := client.ResolveServerlessService(args[0])
@@ -496,12 +745,19 @@ var serverlessLogsCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if !serverlessFollowLogs {
-			return printServerlessReplicaLogs(client, replicas, serverlessDeployLogs, serverlessLogTail, "", serverlessLogTimestamps)
+		sinceTS, err := output.ParseSince(serverlessLogSince)
+		if err != nil {
+			return err
 		}
-		since := fmt.Sprintf("%d", time.Now().Unix())
+		if !serverlessFollowLogs {
+			return printServerlessReplicaLogs(client, replicas, serverlessDeployLogs, serverlessLogTail, sinceTS, serverlessLogTimestamps, serverlessLogGrep, serverlessLogDetect)
+		}
+		since := sinceTS
+		if since == "" {
+			since = fmt.Sprintf("%d", time.Now().Unix())
+		}
 		for {
-			if err := printServerlessReplicaLogs(client, replicas, serverlessDeployLogs, 0, since, serverlessLogTimestamps); err != nil && flagDebug {
+			if err := printServerlessReplicaLogs(client, replicas, serverlessDeployLogs, 0, since, serverlessLogTimestamps, serverlessLogGrep, false); err != nil && flagDebug {
 				fmt.Fprintf(os.Stderr, "[DEBUG] log poll failed: %v\n", err)
 			}
 			since = fmt.Sprintf("%d", time.Now().Unix())
@@ -937,18 +1193,23 @@ func printServerlessServices(services []api.ServerlessService) {
 			fmt.Println("No serverless endpoints found.")
 			return
 		}
-		headers := []string{"UUID", "NAME", "STATUS", "GPU", "REPLICAS", "REQUESTS", "URL"}
+		headers := []string{"UUID", "NAME", "STATUS", "GPU", "VOLUME", "REPLICAS", "REQUESTS", "URL"}
 		rows := make([][]string, len(services))
 		for i, service := range services {
 			status := "paused"
 			if service.IsEnabled {
 				status = "active"
 			}
+			volume := service.NetworkVolumeName
+			if volume == "" {
+				volume = "-"
+			}
 			rows[i] = []string{
 				shortID(service.UUID),
 				service.Name,
 				output.StatusColor(status),
 				service.GPUTypeName,
+				volume,
 				fmt.Sprintf("%d/%d", service.ActiveReplicasCount, service.MaxReplicas),
 				fmt.Sprintf("%d", service.TotalRequestsCount),
 				service.EndpointURL,
@@ -1042,7 +1303,7 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	}
 
 	fmt.Printf("\nReplicas:\n")
-	printServerlessReplicas(detail.Replicas)
+	printServerlessReplicas(detail.Replicas, nil)
 
 	if len(detail.AutoscalingLogs.Data) > 0 {
 		fmt.Printf("\nRecent autoscaling logs:\n")
@@ -1096,28 +1357,119 @@ func resolveServerlessReplicaUUID(client *api.Client, identifier, partial string
 	}
 }
 
-func printServerlessReplicas(replicas []api.ServerlessReplica) {
+// enrichReplica builds the machine-facing replica object with fields that are
+// always populated, even when the raw API row leaves them blank: server, a
+// non-empty status, created, and a derived age/uptime. This is the single
+// source of truth for replica JSON; staleness (#13) and code version (#14)
+// extend the map elsewhere.
+func enrichReplica(r api.ServerlessReplica) map[string]interface{} {
+	server := ""
+	if r.Server != nil {
+		server = r.Server["name"]
+	}
+
+	m := map[string]interface{}{
+		"uuid":       r.UUID,
+		"name":       r.ServerName,
+		"server":     firstNonEmpty(server, r.ServerName, "-"),
+		"status":     firstNonEmpty(r.Status, "unknown"),
+		"created":    firstNonEmpty(r.CreatedAt, ""),
+		"created_at": r.CreatedAt,
+		"updated_at": r.UpdatedAt,
+		"has_logs":   r.HasLogs,
+		"uptime":     r.Uptime,
+		"age":        "-",
+	}
+
+	if t, ok := output.ParseTimestamp(r.CreatedAt); ok {
+		age := time.Since(t)
+		m["age"] = output.HumanDuration(age)
+		m["age_seconds"] = int64(age.Seconds())
+		// The API often leaves uptime blank; derive it from created so machine
+		// consumers always get a duration.
+		if strings.TrimSpace(r.Uptime) == "" {
+			m["uptime"] = output.HumanDuration(age)
+		}
+	}
+	return m
+}
+
+func enrichReplicas(replicas []api.ServerlessReplica) []map[string]interface{} {
+	return enrichReplicasWithStale(replicas, nil)
+}
+
+// enrichReplicasWithStale is enrichReplicas plus staleness fields when a stale
+// map is provided (from --stale).
+func enrichReplicasWithStale(replicas []api.ServerlessReplica, stale map[string]*staleResult) []map[string]interface{} {
+	out := make([]map[string]interface{}, len(replicas))
+	for i, r := range replicas {
+		m := enrichReplica(r)
+		if res, ok := stale[r.UUID]; ok && res != nil && res.Checked {
+			m["stale"] = res.Stale
+			m["volume_newest_file"] = res.NewestFile
+			if !res.NewestTime.IsZero() {
+				m["volume_newest_mtime"] = res.NewestTime.UTC().Format(time.RFC3339)
+			}
+		}
+		out[i] = m
+	}
+	return out
+}
+
+func printServerlessReplicas(replicas []api.ServerlessReplica, stale map[string]*staleResult) {
 	if len(replicas) == 0 {
 		fmt.Println("No replicas found.")
 		return
 	}
-	headers := []string{"UUID", "NAME", "STATUS", "SERVER", "UPTIME", "CREATED"}
+	headers := []string{"UUID", "NAME", "STATUS", "SERVER", "AGE", "CREATED"}
+	if stale != nil {
+		headers = append(headers, "CODE")
+	}
 	rows := make([][]string, len(replicas))
 	for i, replica := range replicas {
 		server := ""
 		if replica.Server != nil {
 			server = replica.Server["name"]
 		}
-		rows[i] = []string{
+		row := []string{
 			shortID(replica.UUID),
 			replica.ServerName,
 			output.StatusColor(replica.Status),
 			server,
-			replica.Uptime,
+			output.Age(replica.CreatedAt),
 			shortTime(replica.CreatedAt),
 		}
+		if stale != nil {
+			row = append(row, staleCell(stale[replica.UUID]))
+		}
+		rows[i] = row
 	}
 	output.PrintTable(headers, rows)
+
+	if stale != nil {
+		if sample := firstStaleResult(stale); sample != nil && sample.Checked && !sample.NewestTime.IsZero() {
+			fmt.Printf("Volume newest file: %s (%s)\n", sample.NewestFile, shortTime(sample.NewestTime.Format(time.RFC3339)))
+		}
+	}
+}
+
+// staleCell renders the CODE column: whether a replica may be running code older
+// than the volume.
+func staleCell(res *staleResult) string {
+	if res == nil || !res.Checked {
+		return "-"
+	}
+	if res.Stale {
+		return output.Warn("⚠ stale")
+	}
+	return output.Good("ok")
+}
+
+func firstStaleResult(stale map[string]*staleResult) *staleResult {
+	for _, v := range stale {
+		return v
+	}
+	return nil
 }
 
 func printServerlessRequests(page *api.ServerlessPage[api.ServerlessRequestLog], details bool) {
@@ -1279,18 +1631,25 @@ func selectServerlessLogReplicas(replicas []api.ServerlessReplica, selector stri
 	return []api.ServerlessReplica{replicas[0]}, nil
 }
 
-func printServerlessReplicaLogs(client *api.Client, replicas []api.ServerlessReplica, deploy bool, tail int, since string, timestamps bool) error {
+func printServerlessReplicaLogs(client *api.Client, replicas []api.ServerlessReplica, deploy bool, tail int, since string, timestamps bool, grep string, detect bool) error {
 	results := make(map[string]string)
 	for _, replica := range replicas {
 		var logs string
 		var err error
 		if deploy {
 			logs, err = client.GetDeploymentLogs(replica.UUID)
+			logs = tailLines(logs, tail)
 		} else {
 			logs, err = client.GetContainerLogs(replica.UUID, tail, since, timestamps)
 		}
 		if err != nil {
 			return err
+		}
+		if grep != "" {
+			logs, err = grepLogs(logs, grep)
+			if err != nil {
+				return err
+			}
 		}
 		results[replica.UUID] = logs
 	}
@@ -1306,6 +1665,14 @@ func printServerlessReplicaLogs(client *api.Client, replicas []api.ServerlessRep
 		fmt.Print(logs)
 		if logs != "" && logs[len(logs)-1] != '\n' {
 			fmt.Println()
+		}
+		if detect {
+			if issues := detectLogIssues(logs); len(issues) > 0 {
+				fmt.Fprintf(os.Stderr, "\n%s detected in %s:\n", output.Warn("Issues"), shortID(replica.UUID))
+				for _, iss := range issues {
+					fmt.Fprintf(os.Stderr, "  %s x%d  %s\n", iss.Category, iss.Count, iss.Sample)
+				}
+			}
 		}
 	}
 	return nil
@@ -1493,11 +1860,10 @@ func shortID(value string) string {
 	return value
 }
 
+// shortTime renders an API timestamp in the active timezone (see --tz). It is a
+// thin wrapper over output.FormatTime so every call site is timezone-consistent.
 func shortTime(value string) string {
-	if len(value) > 16 {
-		return value[:16]
-	}
-	return value
+	return output.FormatTime(value)
 }
 
 func addQueryParam(rawURL, key, value string) string {

@@ -63,6 +63,17 @@ func StatusColor(status string) string {
 	}
 }
 
+// Warn returns the string in a warning color (red) for inline highlights like
+// stale-replica flags.
+func Warn(s string) string {
+	return color.RedString(s)
+}
+
+// Good returns the string in green for positive inline states.
+func Good(s string) string {
+	return color.GreenString(s)
+}
+
 func PrintError(msg string) {
 	fmt.Fprintf(os.Stderr, "%s %s\n", color.RedString("Error:"), msg)
 }

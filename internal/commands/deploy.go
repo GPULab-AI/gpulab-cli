@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/briandowns/spinner"
 	"github.com/GPULab-AI/gpulab-cli/internal/api"
 	"github.com/GPULab-AI/gpulab-cli/internal/output"
+	"github.com/briandowns/spinner"
 	"github.com/spf13/cobra"
 )
 
