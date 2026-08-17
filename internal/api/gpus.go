@@ -6,23 +6,23 @@ import (
 )
 
 type GPUType struct {
-	GPUName        string      `json:"gpu_name"`
-	GPUTotalMemory int         `json:"gpu_total_memory"`
-	GPUPrice       json.Number `json:"gpu_price"`
-	AvailableCount int         `json:"available_count"`
+	GPUName        string    `json:"gpu_name"`
+	GPUTotalMemory int       `json:"gpu_total_memory"`
+	GPUPrice       FlexFloat `json:"gpu_price"`
+	AvailableCount int       `json:"available_count"`
 }
 
 type AvailableGPUsResponse struct {
-	TotalAvailable int          `json:"total_available"`
-	Summary        []GPUSummary `json:"summary"`
+	TotalAvailable int           `json:"total_available"`
+	Summary        []GPUSummary  `json:"summary"`
 	GPUs           []interface{} `json:"gpus"`
 }
 
 type GPUSummary struct {
-	Count    int      `json:"count"`
-	GPUName  string   `json:"gpu_name"`
-	MemoryMB int      `json:"memory_mb"`
-	Price    *float64 `json:"price"`
+	Count    int       `json:"count"`
+	GPUName  string    `json:"gpu_name"`
+	MemoryMB int       `json:"memory_mb"`
+	Price    FlexFloat `json:"price"`
 }
 
 func (c *Client) ListGPUTypes() ([]GPUType, error) {

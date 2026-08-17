@@ -41,7 +41,7 @@ var gpusTypesCmd = &cobra.Command{
 			rows := make([][]string, len(types))
 			for i, t := range types {
 				price := "-"
-				if pf, err := t.GPUPrice.Float64(); err == nil && pf > 0 {
+				if pf, ok := t.GPUPrice.Float64(); ok && pf > 0 {
 					price = fmt.Sprintf("$%.2f/hr", pf)
 				}
 				rows[i] = []string{

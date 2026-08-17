@@ -1571,7 +1571,7 @@ func printServerlessOptions(options *api.ServerlessOptions) {
 	gpuRows := make([][]string, len(options.GPUTypes))
 	for i, gpu := range options.GPUTypes {
 		price := "-"
-		if value, err := gpu.GPUPrice.Float64(); err == nil && value > 0 {
+		if value, ok := gpu.GPUPrice.Float64(); ok && value > 0 {
 			price = fmt.Sprintf("$%.2f/hr", value)
 		}
 		gpuRows[i] = []string{strconv.Itoa(gpu.ID), gpu.GPUName, fmt.Sprintf("%d MB", gpu.GPUTotalMemory), fmt.Sprintf("%d", gpu.FreeGPUsCount), price}

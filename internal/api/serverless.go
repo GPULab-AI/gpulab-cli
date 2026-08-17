@@ -169,11 +169,11 @@ type ServerlessTemplateOption struct {
 }
 
 type ServerlessGPUTypeOption struct {
-	ID             int         `json:"id"`
-	GPUName        string      `json:"gpu_name"`
-	GPUTotalMemory int         `json:"gpu_total_memory"`
-	GPUPrice       json.Number `json:"gpu_price"`
-	FreeGPUsCount  int         `json:"free_gpus_count"`
+	ID             int       `json:"id"`
+	GPUName        string    `json:"gpu_name"`
+	GPUTotalMemory int       `json:"gpu_total_memory"`
+	GPUPrice       FlexFloat `json:"gpu_price"`
+	FreeGPUsCount  int       `json:"free_gpus_count"`
 }
 
 type ServerlessRegionOption struct {
