@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GPULab-AI/gpulab-cli/internal/api"
@@ -77,6 +78,7 @@ var (
 	serverlessRestartWait      int
 	serverlessReplicaDrain     bool
 	serverlessListVolume       string
+	serverlessListWithPolicy   bool
 	serverlessReplicasStale    bool
 	serverlessStaleDepth       int
 	serverlessStaleCodePath    string
@@ -106,6 +108,7 @@ func init() {
 	addServerlessWriteFlags(serverlessUpdateCmd, false)
 
 	serverlessListCmd.Flags().StringVar(&serverlessListVolume, "volume", "", "Only show endpoints using this network volume (UUID, name, or ID)")
+	serverlessListCmd.Flags().BoolVar(&serverlessListWithPolicy, "with-policy", false, "Load each endpoint's autoscaling policy, which the list API does not return")
 
 	serverlessReplicasCmd.Flags().BoolVar(&serverlessReplicasStale, "stale", false, "Flag replicas started before the volume's newest code file (running old code)")
 	serverlessReplicasCmd.Flags().IntVar(&serverlessStaleDepth, "depth", 2, "Directory depth to scan for the volume's newest file when --stale")
@@ -218,6 +221,9 @@ var serverlessListCmd = &cobra.Command{
 		}
 		if serverlessListVolume != "" {
 			services = filterServicesByVolume(services, serverlessListVolume)
+		}
+		if serverlessListWithPolicy {
+			services = hydrateServerlessPolicies(client, services)
 		}
 		printServerlessServices(services)
 		return nil
@@ -893,7 +899,11 @@ func buildServerlessRequest(cmd *cobra.Command, client *api.Client, existing *ap
 	}
 
 	if existing != nil {
-		req = serverlessRequestFromService(*existing)
+		fromExisting, err := serverlessRequestFromService(*existing)
+		if err != nil {
+			return nil, err
+		}
+		req = fromExisting
 	}
 
 	setStringFlag(cmd, "name", &req.Name, serverlessName)
@@ -1079,7 +1089,17 @@ func resolveServerlessVolumeOption(options []api.ServerlessNetworkVolumeOption, 
 	return nil, fmt.Errorf("serverless network volume %q is ambiguous", value)
 }
 
-func serverlessRequestFromService(service api.ServerlessService) *api.ServerlessServiceRequest {
+// serverlessRequestFromService turns an existing endpoint into a full update
+// request, so that `serverless update` preserves every field the caller did not
+// pass a flag for. It requires a service loaded from the detail endpoint: the
+// list payload leaves the configuration block out, and copying those blanks
+// into an update would erase the endpoint's autoscaling policy, command, and
+// notes.
+func serverlessRequestFromService(service api.ServerlessService) (*api.ServerlessServiceRequest, error) {
+	if !service.AutoscalingPolicyCode.Known() {
+		return nil, fmt.Errorf("internal error: endpoint %q was loaded without its configuration; "+
+			"updating from it would erase the autoscaling policy", service.Name)
+	}
 	req := &api.ServerlessServiceRequest{
 		Name:                     service.Name,
 		IsEnabled:                service.IsEnabled,
@@ -1095,23 +1115,23 @@ func serverlessRequestFromService(service api.ServerlessService) *api.Serverless
 		MaxConcurrentRequests:    service.MaxConcurrentRequests,
 		AllowOverflowRequests:    service.AllowOverflowRequests,
 		AutoscalingEnabled:       service.AutoscalingEnabled,
-		AutoscalingTemplateKey:   service.AutoscalingTemplateKey,
-		AutoscalingPolicyCode:    service.AutoscalingPolicyCode,
-		AutoscalingMetricsConfig: service.AutoscalingMetricsConfig,
+		AutoscalingTemplateKey:   service.AutoscalingTemplateKey.String(),
+		AutoscalingPolicyCode:    service.AutoscalingPolicyCode.String(),
+		AutoscalingMetricsConfig: service.AutoscalingMetricsConfig.String(),
 		IdleTimeoutSeconds:       service.IdleTimeoutSeconds,
 		ColdStartTimeoutSeconds:  service.ColdStartTimeoutSeconds,
 		RequestTimeoutSeconds:    service.RequestTimeoutSeconds,
 		ImagePullPolicy:          service.ImagePullPolicy,
-		CUDAVersion:              service.CUDAVersion,
-		EnvironmentVariables:     service.EnvironmentVariables,
-		Command:                  service.Command,
-		Notes:                    service.Notes,
+		CUDAVersion:              service.CUDAVersion.String(),
+		EnvironmentVariables:     service.EnvironmentVariables.String(),
+		Command:                  service.Command.String(),
+		Notes:                    service.Notes.String(),
 	}
 	if service.NetworkVolumeID != nil {
 		v := *service.NetworkVolumeID
 		req.NetworkVolumeID = &v
 	}
-	return req
+	return req, nil
 }
 
 func resolveServerlessPolicyInputs(client *api.Client, templateKey string) (string, interface{}, error) {
@@ -1178,6 +1198,58 @@ func fetchAllServerlessPages[T any](fetch func(page int) (*api.ServerlessPage[T]
 	return first, nil
 }
 
+// hydrateServerlessPolicies fills in the configuration block that the list API
+// leaves out, by loading each endpoint's detail concurrently. An endpoint whose
+// detail fails to load keeps its unknown fields, so the caller still reports it
+// as unknown rather than as having no policy.
+func hydrateServerlessPolicies(client *api.Client, services []api.ServerlessService) []api.ServerlessService {
+	const workers = 8
+
+	out := make([]api.ServerlessService, len(services))
+	copy(out, services)
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				detail, err := client.GetServerlessService(out[i].UUID)
+				if err != nil {
+					continue
+				}
+				out[i] = detail.Data
+			}
+		}()
+	}
+	for i := range out {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return out
+}
+
+// scalingCell states an endpoint's autoscaling policy in one table cell. It
+// never renders an unreported policy as "none": an operator who reads "none"
+// goes and attaches a policy that is already attached.
+func scalingCell(service api.ServerlessService) string {
+	if !service.AutoscalingEnabled {
+		return "off"
+	}
+	switch {
+	case service.AutoscalingTemplateKey.Set():
+		return "on:" + service.AutoscalingTemplateKey.String()
+	case service.AutoscalingPolicyCode.Set():
+		return "on:custom"
+	case service.AutoscalingPolicyCode.Known() || service.AutoscalingTemplateKey.Known():
+		return output.Warn("on:no-policy")
+	default:
+		return "on:?"
+	}
+}
+
 func printServerlessServices(services []api.ServerlessService) {
 	switch getOutputFormat() {
 	case output.FormatJSON:
@@ -1193,8 +1265,9 @@ func printServerlessServices(services []api.ServerlessService) {
 			fmt.Println("No serverless endpoints found.")
 			return
 		}
-		headers := []string{"UUID", "NAME", "STATUS", "GPU", "VOLUME", "REPLICAS", "REQUESTS", "URL"}
+		headers := []string{"UUID", "NAME", "STATUS", "GPU", "VOLUME", "REPLICAS", "SCALING", "REQUESTS", "URL"}
 		rows := make([][]string, len(services))
+		unknownPolicies := 0
 		for i, service := range services {
 			status := "paused"
 			if service.IsEnabled {
@@ -1204,6 +1277,9 @@ func printServerlessServices(services []api.ServerlessService) {
 			if volume == "" {
 				volume = "-"
 			}
+			if service.AutoscalingEnabled && !service.AutoscalingPolicyCode.Known() {
+				unknownPolicies++
+			}
 			rows[i] = []string{
 				shortID(service.UUID),
 				service.Name,
@@ -1211,11 +1287,17 @@ func printServerlessServices(services []api.ServerlessService) {
 				service.GPUTypeName,
 				volume,
 				fmt.Sprintf("%d/%d", service.ActiveReplicasCount, service.MaxReplicas),
+				scalingCell(service),
 				fmt.Sprintf("%d", service.TotalRequestsCount),
 				service.EndpointURL,
 			}
 		}
 		output.PrintTable(headers, rows)
+		if unknownPolicies > 0 {
+			fmt.Printf("\n%s\n", output.Dim(fmt.Sprintf(
+				"SCALING on:? — the list API does not return the policy for %d endpoint(s). Add --with-policy to load it.",
+				unknownPolicies)))
+		}
 	}
 }
 
@@ -1237,7 +1319,7 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	fmt.Printf("  Port:        %d\n", service.EndpointPort)
 	fmt.Printf("  Health:      %s\n", service.HealthCheckPath)
 	fmt.Printf("  Pull policy: %s\n", service.ImagePullPolicy)
-	if service.CUDAVersion != "" {
+	if service.CUDAVersion.Set() {
 		fmt.Printf("  CUDA:        %s\n", service.CUDAVersion)
 	}
 
@@ -1250,7 +1332,7 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 		if service.NetworkVolumeMaxSize != nil {
 			fmt.Printf("  Size:        %d GB\n", *service.NetworkVolumeMaxSize)
 		}
-		if service.TemplateVolumeMountPath != "" {
+		if service.TemplateVolumeMountPath.Set() {
 			fmt.Printf("  Mount path:  %s\n", service.TemplateVolumeMountPath)
 		}
 	} else {
@@ -1262,21 +1344,7 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	fmt.Printf("  Concurrency: %d per replica\n", service.MaxConcurrentRequests)
 	fmt.Printf("  Overflow:    %s\n", boolStatus(service.AllowOverflowRequests, "enabled", "disabled"))
 	fmt.Printf("  Autoscaling: %s\n", boolStatus(service.AutoscalingEnabled, "enabled", "disabled"))
-	if service.AutoscalingTemplateKey != "" {
-		fmt.Printf("  Template:    %s\n", service.AutoscalingTemplateKey)
-	}
-	if service.AutoscalingPolicyCode != "" {
-		fmt.Printf("  Policy:      %s\n", summarizeText(service.AutoscalingPolicyCode))
-	}
-	if service.AutoscalingMetricsConfig != "" {
-		fmt.Printf("  Metrics:     %s\n", summarizeText(service.AutoscalingMetricsConfig))
-	}
-	if service.AutoscalingLastEvaluatedAt != "" {
-		fmt.Printf("  Last eval:   %s\n", shortTime(service.AutoscalingLastEvaluatedAt))
-	}
-	if service.AutoscalingLastErrorAt != "" {
-		fmt.Printf("  Last error:  %s\n", shortTime(service.AutoscalingLastErrorAt))
-	}
+	printAutoscalingPolicy(service, "  ")
 
 	fmt.Printf("\nTimeouts:\n")
 	fmt.Printf("  Idle:        %ds\n", service.IdleTimeoutSeconds)
@@ -1295,10 +1363,10 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	if len(service.EnvironmentVariablesMap) > 0 {
 		fmt.Printf("\nEnvironment:   %d variable(s)\n", len(service.EnvironmentVariablesMap))
 	}
-	if service.Command != "" {
+	if service.Command.Set() {
 		fmt.Printf("Command:       %s\n", service.Command)
 	}
-	if service.Notes != "" {
+	if service.Notes.Set() {
 		fmt.Printf("Notes:         %s\n", service.Notes)
 	}
 
@@ -1308,6 +1376,41 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	if len(detail.AutoscalingLogs.Data) > 0 {
 		fmt.Printf("\nRecent autoscaling logs:\n")
 		printServerlessAutoscalingLogs(&detail.AutoscalingLogs, false)
+	}
+}
+
+// printAutoscalingPolicy describes the policy attached to an endpoint. An
+// endpoint with autoscaling on and no policy behaves nothing like one whose
+// policy this payload simply does not carry, so neither case prints a blank:
+// the first is called out as a real misconfiguration, the second points at the
+// command that does return the policy.
+func printAutoscalingPolicy(service api.ServerlessService, indent string) {
+	if !service.AutoscalingPolicyCode.Known() && !service.AutoscalingTemplateKey.Known() {
+		if service.AutoscalingEnabled {
+			fmt.Printf("%sPolicy:      %s\n", indent,
+				output.Warn("not reported by this command — run 'gpulab serverless inspect <endpoint>'"))
+		}
+		return
+	}
+	if service.AutoscalingEnabled && !service.AutoscalingTemplateKey.Set() && !service.AutoscalingPolicyCode.Set() {
+		fmt.Printf("%sPolicy:      %s\n", indent,
+			output.Warn("none attached — autoscaling is on with nothing to evaluate"))
+		return
+	}
+	if service.AutoscalingTemplateKey.Set() {
+		fmt.Printf("%sTemplate:    %s\n", indent, service.AutoscalingTemplateKey)
+	}
+	if service.AutoscalingPolicyCode.Set() {
+		fmt.Printf("%sPolicy:      %s\n", indent, summarizeText(service.AutoscalingPolicyCode.String()))
+	}
+	if service.AutoscalingMetricsConfig.Set() {
+		fmt.Printf("%sMetrics:     %s\n", indent, summarizeText(service.AutoscalingMetricsConfig.String()))
+	}
+	if service.AutoscalingLastEvaluatedAt.Set() {
+		fmt.Printf("%sLast eval:   %s\n", indent, shortTime(service.AutoscalingLastEvaluatedAt.String()))
+	}
+	if service.AutoscalingLastErrorAt.Set() {
+		fmt.Printf("%sLast error:  %s\n", indent, shortTime(service.AutoscalingLastErrorAt.String()))
 	}
 }
 

@@ -74,6 +74,12 @@ func Good(s string) string {
 	return color.GreenString(s)
 }
 
+// Dim returns the string in a muted color, for footnotes that explain a table
+// rather than add data to it.
+func Dim(s string) string {
+	return color.HiBlackString(s)
+}
+
 func PrintError(msg string) {
 	fmt.Fprintf(os.Stderr, "%s %s\n", color.RedString("Error:"), msg)
 }

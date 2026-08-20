@@ -184,6 +184,9 @@ gpulab serverless deploy llama-api ./tasks.py --to server/tasks.py --drain
 
 # One health surface: error rate, 4xx/5xx, latency, queue depth, cold starts,
 # scaling ping-pong, and (with --logs) detected tracebacks / CUDA OOM.
+# It also reports the metrics the autoscaling policy collects (queue_num,
+# queue_time, ...) and counts evaluations that asked for replicas and got none,
+# so a queue-backed endpoint starved of GPUs does not read as healthy.
 gpulab serverless health llama-api --logs
 
 # Trace one request end to end: queued → started → completed, with the HTTP result.
@@ -205,6 +208,28 @@ gpulab serverless logs llama-api --replica all --since 10m --grep Traceback --de
 # Which endpoints use a volume? (reverse lookup)
 gpulab volumes endpoints my-volume
 gpulab serverless list --volume my-volume
+
+# Which autoscaling policy is attached? The list API does not return the policy,
+# so the SCALING column reads "on:?" until --with-policy loads each endpoint.
+# It never reports an unknown policy as an absent one.
+gpulab serverless list --with-policy
+```
+
+### Capacity: free vs placeable GPUs
+
+`gpulab gpus` reports two counts, and they are not the same number:
+
+- **FREE** — every unassigned, online GPU.
+- **PLACEABLE** — the subset the scheduler will actually put work on. A GPU on a
+  host that is in maintenance, or that is not a GPU host, is free forever and
+  placeable never.
+
+Scale against PLACEABLE. An endpoint's own region and CUDA filters can lower it
+further, so treat it as an upper bound for any one endpoint.
+
+```bash
+gpulab gpus              # GPU types with FREE and PLACEABLE side by side
+gpulab gpus available    # the same split, per GPU currently free
 ```
 
 > **Note on reloading code.** `serverless restart` / `serverless deploy` reload
@@ -307,14 +332,16 @@ Passwords/tokens are write-only — they are never returned by `credentials list
 | `gpulab credentials` | List Docker registry credentials |
 | `gpulab credentials add --username <u> --password <p>` | Store a registry credential |
 | `gpulab credentials rm <id>` | Delete a registry credential |
-| `gpulab gpus types` | List GPU types |
+| `gpulab gpus types` | List GPU types with free vs placeable counts |
+| `gpulab gpus available` | Free GPUs by type, with placeable counts |
 | `gpulab volumes` | List volumes |
 | `gpulab volumes sync <dir> <volume> [remote]` | rsync-style sync a local dir to a volume |
 | `gpulab volumes endpoints <volume>` | List endpoints that use a volume (reverse lookup) |
 | `gpulab volumes files upload <volume> <file> --to <path>` | Upload a file, renamed |
 | `gpulab serverless` | Manage serverless GPU endpoints |
 | `gpulab serverless deploy <endpoint> <file>` | Upload → verify → rolling restart → smoke test |
-| `gpulab serverless health <endpoint>` | Error rate, latency, queue, crashes, cold starts |
+| `gpulab serverless health <endpoint>` | Error rate, latency, queue, policy metrics, blocked scale-ups |
+| `gpulab serverless list --with-policy` | List endpoints with their autoscaling policy loaded |
 | `gpulab serverless trace <request-uuid>` | Trace a request's lifecycle |
 | `gpulab serverless restart <endpoint> [replica\|--all]` | Restart replicas (rolling/drain) |
 | `gpulab serverless replicas <endpoint> --stale` | Replica ages + stale-code detection |

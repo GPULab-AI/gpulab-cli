@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -78,7 +79,7 @@ OOMs.`,
 			stale, _ = computeReplicaStaleness(client, svc.NetworkVolumeUUID, "", detail.Replicas, 2)
 		}
 
-		verdict := healthVerdict(stats, svc, issues, reqFetchErr == nil)
+		verdict := healthVerdict(stats, svc, asStats, issues, reqFetchErr == nil)
 
 		if flagJSON {
 			output.PrintJSON(map[string]interface{}{
@@ -176,6 +177,37 @@ type autoscalingStats struct {
 	LastError    string `json:"last_error"`
 	PingPong     bool   `json:"ping_pong"`
 	WindowCount  int    `json:"window_count"`
+
+	// Metrics the policy last collected, e.g. queue_num and queue_time for a
+	// ModelQ-backed endpoint. Work reaches those endpoints over Redis, not over
+	// the HTTP request queue, so the request counters can read as idle while a
+	// real backlog builds. These are the numbers the policy actually scales on.
+	LatestMetrics   map[string]float64 `json:"latest_metrics"`
+	LatestMetricsAt string             `json:"latest_metrics_at"`
+
+	// Blocked counts evaluations where the policy asked for more replicas and
+	// got none — capacity the endpoint wanted and did not receive.
+	Blocked         int    `json:"blocked_evaluations"`
+	LastBlockedAt   string `json:"last_blocked_at"`
+	LastBlockReason string `json:"last_block_reason"`
+
+	// DerivedLastScaledAt is the newest evaluation that actually changed the
+	// replica count. The service row's own last_scaled_at can lag behind it.
+	DerivedLastScaledAt string `json:"derived_last_scaled_at"`
+}
+
+// numberFrom reads a JSON number out of a decoded log context.
+func numberFrom(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
 }
 
 func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingLog]) autoscalingStats {
@@ -202,7 +234,23 @@ func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingL
 			}
 		}
 		blob := strings.ToLower(log.Event + " " + log.Message)
+		reconcile, haveReconcile := log.Context["reconcile"].(map[string]interface{})
 		switch {
+		case haveReconcile:
+			// reconcile records what the evaluation actually did. Prefer it:
+			// the current_replicas and desired_replicas columns are both written
+			// after reconciliation, so they read equal even on an evaluation
+			// that replaced a replica, and comparing them counts nothing.
+			up, _ := numberFrom(reconcile["scaled_up"])
+			down, _ := numberFrom(reconcile["scaled_down"])
+			s.ScaleUps += int(up)
+			s.ScaleDowns += int(down)
+			if up > 0 {
+				dirs = append(dirs, 1)
+			}
+			if down > 0 {
+				dirs = append(dirs, -1)
+			}
 		case log.CurrentReplicas != nil && log.DesiredReplicas != nil && *log.DesiredReplicas > *log.CurrentReplicas:
 			s.ScaleUps++
 			dirs = append(dirs, 1)
@@ -224,6 +272,43 @@ func computeAutoscalingStats(page *api.ServerlessPage[api.ServerlessAutoscalingL
 		}
 		if strings.Contains(blob, "cold start") || strings.Contains(blob, "cold_start") || strings.Contains(blob, "provision") {
 			s.ColdStarts++
+		}
+
+		// Keep the newest metric sample the collector managed to take. Walking
+		// chronologically means later assignments win.
+		if len(log.Metrics) > 0 {
+			values := map[string]float64{}
+			for name, raw := range log.Metrics {
+				if f, ok := numberFrom(raw); ok {
+					values[name] = f
+				}
+			}
+			if len(values) > 0 {
+				s.LatestMetrics = values
+				s.LatestMetricsAt = log.CreatedAt
+			}
+		}
+
+		exception, _ := log.Context["exception"].(string)
+		if haveReconcile {
+			current, haveCurrent := numberFrom(reconcile["current"])
+			desired, haveDesired := numberFrom(reconcile["desired"])
+			up, _ := numberFrom(reconcile["scaled_up"])
+			down, _ := numberFrom(reconcile["scaled_down"])
+			if up > 0 || down > 0 {
+				s.DerivedLastScaledAt = log.CreatedAt
+			}
+			// The policy asked for more and received nothing. On a saturated
+			// endpoint this, not the HTTP error rate, is the real symptom.
+			if haveCurrent && haveDesired && desired > current && up == 0 {
+				s.Blocked++
+				s.LastBlockedAt = log.CreatedAt
+				s.LastBlockReason = firstNonEmpty(exception, log.Message)
+			}
+		} else if exception != "" {
+			s.Blocked++
+			s.LastBlockedAt = log.CreatedAt
+			s.LastBlockReason = exception
 		}
 	}
 	// Ping-pong = actual back-and-forth, not just high counts (which slow cold
@@ -278,13 +363,38 @@ func scanReplicaIssues(client *api.Client, replicas []api.ServerlessReplica) []l
 	return out
 }
 
-func healthVerdict(stats requestStats, svc api.ServerlessService, issues []logIssue, fetchOK bool) string {
+// queueBacklog reports the largest queue-depth metric the policy last collected.
+// A ModelQ-backed endpoint takes its work off Redis, so a backlog there never
+// touches the HTTP request counters this command otherwise reads.
+func queueBacklog(as autoscalingStats) (string, float64, bool) {
+	var name string
+	var depth float64
+	for metric, value := range as.LatestMetrics {
+		if !strings.Contains(strings.ToLower(metric), "queue") || strings.Contains(strings.ToLower(metric), "time") {
+			continue
+		}
+		if name == "" || value > depth {
+			name, depth = metric, value
+		}
+	}
+	return name, depth, name != ""
+}
+
+func healthVerdict(stats requestStats, svc api.ServerlessService, as autoscalingStats, issues []logIssue, fetchOK bool) string {
+	_, backlog, haveBacklog := queueBacklog(as)
 	switch {
 	case !fetchOK && stats.Total == 0:
 		// Couldn't read request logs — don't claim healthy when we're blind.
 		return "unknown"
 	case stats.Total > 0 && stats.ErrorRate >= 20:
 		return "unhealthy"
+	// The policy asked for replicas and got none while work is waiting. The
+	// HTTP counters stay clean throughout, so without this the command would
+	// call a starved endpoint healthy.
+	case as.Blocked > 0 && haveBacklog && backlog > 0:
+		return "unhealthy"
+	case as.Blocked > 0 || (haveBacklog && backlog > 0 && svc.ActiveReplicasCount == 0):
+		return "degraded"
 	case len(issues) > 0 || (stats.Total > 0 && stats.ErrorRate >= 5) || (svc.ActiveReplicasCount == 0 && svc.MinReplicas > 0):
 		return "degraded"
 	default:
@@ -318,7 +428,24 @@ func printHealth(svc api.ServerlessService, identifier, verdict string, stats re
 	if stats.AvgMS > 0 {
 		fmt.Printf("  latency     avg %dms, p95 %dms\n", stats.AvgMS, stats.P95MS)
 	}
-	fmt.Printf("  queued now  %d\n", svc.QueuedRequestsCount)
+	fmt.Printf("  queued now  %d (HTTP request queue)\n", svc.QueuedRequestsCount)
+
+	if len(as.LatestMetrics) > 0 {
+		fmt.Printf("\nPolicy metrics (collected %s):\n", shortTime(as.LatestMetricsAt))
+		names := make([]string, 0, len(as.LatestMetrics))
+		for name := range as.LatestMetrics {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			value := fmt.Sprintf("%g", as.LatestMetrics[name])
+			if _, backlog, ok := queueBacklog(as); ok && backlog > 0 && as.LatestMetrics[name] == backlog {
+				value = output.Warn(value)
+			}
+			fmt.Printf("  %-11s %s\n", name, value)
+		}
+		fmt.Printf("  %s\n", output.Dim("these are what the autoscaling policy scales on, not the HTTP queue above"))
+	}
 
 	fmt.Printf("\nAutoscaling (last %d events):\n", as.WindowCount)
 	fmt.Printf("  scale-ups   %d\n", as.ScaleUps)
@@ -329,6 +456,16 @@ func printHealth(svc api.ServerlessService, identifier, verdict string, stats re
 	fmt.Printf("  errors      %d\n", as.Errors)
 	if as.PingPong {
 		fmt.Printf("  %s\n", output.Warn("⚠ scaling ping-pong detected (frequent up+down)"))
+	}
+	if as.Blocked > 0 {
+		fmt.Printf("  %s\n", output.Warn(fmt.Sprintf(
+			"⚠ %d evaluation(s) wanted more replicas and got none", as.Blocked)))
+		if as.LastBlockReason != "" {
+			fmt.Printf("  reason      %s (%s)\n", as.LastBlockReason, shortTime(as.LastBlockedAt))
+		}
+	}
+	if as.DerivedLastScaledAt != "" {
+		fmt.Printf("  last scaled %s\n", shortTime(as.DerivedLastScaledAt))
 	}
 	if as.LastError != "" {
 		fmt.Printf("  last error  %s\n", shortTime(as.LastError))
