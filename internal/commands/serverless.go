@@ -23,7 +23,10 @@ import (
 var (
 	serverlessName             string
 	serverlessTemplate         string
-	serverlessGPUType          string
+	serverlessGPUTypes         []string
+	serverlessAddGPUTypes      []string
+	serverlessRemoveGPUTypes   []string
+	serverlessRequestStatus    []string
 	serverlessRegion           string
 	serverlessVolume           string
 	serverlessGPUCount         int
@@ -124,6 +127,8 @@ func init() {
 	serverlessRequestsCmd.Flags().IntVar(&serverlessPerPage, "per-page", 25, "Rows per page")
 	serverlessRequestsCmd.Flags().BoolVar(&serverlessAllPages, "all", false, "Fetch every page instead of just one")
 	serverlessRequestsCmd.Flags().BoolVar(&serverlessDetails, "details", false, "Print request/response bodies in human output")
+	serverlessRequestsCmd.Flags().StringSliceVar(&serverlessRequestStatus, "status", nil,
+		"Filter by status: queued, provisioning, proxying, completed, failed, timed_out, or the groups in_flight / errors (comma-separate for several)")
 
 	serverlessAutoscalingLogsCmd.Flags().IntVar(&serverlessPage, "page", 1, "Page number")
 	serverlessAutoscalingLogsCmd.Flags().IntVar(&serverlessPerPage, "per-page", 25, "Rows per page")
@@ -166,7 +171,10 @@ func init() {
 func addServerlessWriteFlags(cmd *cobra.Command, create bool) {
 	cmd.Flags().StringVar(&serverlessName, "name", "", "Endpoint name")
 	cmd.Flags().StringVar(&serverlessTemplate, "template", "", "Template ID, UUID, or name")
-	cmd.Flags().StringVar(&serverlessGPUType, "gpu-type", "", "GPU type ID or name")
+	cmd.Flags().StringSliceVar(&serverlessGPUTypes, "gpu-type", nil,
+		"GPU type ID or name; repeat or comma-separate for a preference list (first = preferred, rest = fallbacks), e.g. --gpu-type 1,3")
+	cmd.Flags().StringSliceVar(&serverlessAddGPUTypes, "add-gpu-type", nil, "Append fallback GPU type(s) to the list (ID or name)")
+	cmd.Flags().StringSliceVar(&serverlessRemoveGPUTypes, "remove-gpu-type", nil, "Remove GPU type(s) from the list (ID or name)")
 	cmd.Flags().StringVar(&serverlessRegion, "region", "", "Region ID, slug, or name")
 	cmd.Flags().StringVar(&serverlessVolume, "volume", "", "Network volume ID, UUID, or name")
 	cmd.Flags().IntVar(&serverlessGPUCount, "gpu-count", 1, "GPUs per replica")
@@ -324,6 +332,7 @@ var serverlessCreateCmd = &cobra.Command{
 			return nil
 		}
 		output.PrintSuccess(fmt.Sprintf("Serverless endpoint created: %s", resp.Data.UUID))
+		printServerlessWriteNotes(req, resp)
 		fmt.Printf("Name:         %s\n", resp.Data.Name)
 		fmt.Printf("Endpoint key: %s\n", resp.Data.EndpointKey)
 		fmt.Printf("URL:          %s\n", resp.Data.EndpointURL)
@@ -381,6 +390,7 @@ var serverlessUpdateCmd = &cobra.Command{
 			return nil
 		}
 		output.PrintSuccess(fmt.Sprintf("Serverless endpoint updated: %s", resp.Data.UUID))
+		printServerlessWriteNotes(req, resp)
 		fmt.Printf("Name: %s\n", resp.Data.Name)
 		fmt.Printf("URL:  %s\n", resp.Data.EndpointURL)
 		return nil
@@ -671,10 +681,10 @@ var serverlessRequestsCmd = &cobra.Command{
 		var page *api.ServerlessPage[api.ServerlessRequestLog]
 		if serverlessAllPages {
 			page, err = fetchAllServerlessPages(func(p int) (*api.ServerlessPage[api.ServerlessRequestLog], error) {
-				return client.ListServerlessRequests(identifier, p, serverlessPerPage)
+				return client.ListServerlessRequests(identifier, p, serverlessPerPage, serverlessRequestStatus...)
 			})
 		} else {
-			page, err = client.ListServerlessRequests(identifier, serverlessPage, serverlessPerPage)
+			page, err = client.ListServerlessRequests(identifier, serverlessPage, serverlessPerPage, serverlessRequestStatus...)
 		}
 		if err != nil {
 			return err
@@ -908,7 +918,6 @@ func buildServerlessRequest(cmd *cobra.Command, client *api.Client, existing *ap
 
 	setStringFlag(cmd, "name", &req.Name, serverlessName)
 	setStringFlag(cmd, "template", &req.Template, serverlessTemplate)
-	setStringFlag(cmd, "gpu-type", &req.GPUType, serverlessGPUType)
 	setStringFlag(cmd, "region", &req.Region, serverlessRegion)
 	setStringFlag(cmd, "volume", &req.NetworkVolume, serverlessVolume)
 	setIntFlag(cmd, "gpu-count", &req.GPUCount, serverlessGPUCount)
@@ -945,14 +954,31 @@ func buildServerlessRequest(cmd *cobra.Command, client *api.Client, existing *ap
 	if req.Template == "" && req.TemplateID == 0 {
 		return nil, fmt.Errorf("--template is required")
 	}
-	if req.GPUType == "" && req.GPUTypeID == 0 {
+	gpuTypesChanged := cmd.Flags().Changed("gpu-type") || cmd.Flags().Changed("add-gpu-type") || cmd.Flags().Changed("remove-gpu-type")
+	if !gpuTypesChanged && req.GPUTypeID == 0 {
 		return nil, fmt.Errorf("--gpu-type is required")
 	}
 
-	if req.Template != "" || req.GPUType != "" || req.Region != "" || req.NetworkVolume != "" {
+	if req.Template != "" || gpuTypesChanged || req.Region != "" || req.NetworkVolume != "" {
 		options, err := client.GetServerlessOptions()
 		if err != nil {
 			return nil, err
+		}
+		if gpuTypesChanged {
+			var current []int
+			if existing != nil {
+				current = existing.ServiceGPUTypeIDs()
+			}
+			ids, err := resolveServerlessGPUTypeList(options.GPUTypes, current, serverlessGPUTypes, serverlessAddGPUTypes, serverlessRemoveGPUTypes)
+			if err != nil {
+				return nil, err
+			}
+			if existing != nil && len(ids) > 1 && !existing.SupportsGPUTypeList() {
+				return nil, fmt.Errorf("this GPULab backend does not support multiple GPU types per endpoint yet; pass a single --gpu-type")
+			}
+			req.GPUTypeIDs = ids
+			req.GPUTypeID = ids[0]
+			req.GPUType = ""
 		}
 		if req.Template != "" {
 			template, err := resolveServerlessTemplateOption(options.Templates, req.Template)
@@ -961,14 +987,6 @@ func buildServerlessRequest(cmd *cobra.Command, client *api.Client, existing *ap
 			}
 			req.TemplateID = template.ID
 			req.Template = ""
-		}
-		if req.GPUType != "" {
-			gpuType, err := resolveServerlessGPUTypeOption(options.GPUTypes, req.GPUType)
-			if err != nil {
-				return nil, err
-			}
-			req.GPUTypeID = gpuType.ID
-			req.GPUType = ""
 		}
 		if req.Region != "" {
 			region, err := resolveServerlessRegionOption(options.Regions, req.Region)
@@ -1032,23 +1050,162 @@ func resolveServerlessTemplateOption(options []api.ServerlessTemplateOption, val
 	return nil, fmt.Errorf("serverless template %q is ambiguous", value)
 }
 
+// resolveServerlessGPUTypeOption resolves one GPU type by ID, exact name, or
+// unique substring. Several gpu_types rows share a name with different VRAM
+// (e.g. "RTX 4090" 24 GB and 48 GB), so an exact name that matches more than
+// one row is ambiguous too; the error lists the IDs to choose from.
 func resolveServerlessGPUTypeOption(options []api.ServerlessGPUTypeOption, value string) (*api.ServerlessGPUTypeOption, error) {
-	var matches []api.ServerlessGPUTypeOption
-	for _, option := range options {
-		if strconv.Itoa(option.ID) == value || strings.EqualFold(option.GPUName, value) {
-			return &option, nil
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("empty GPU type")
+	}
+	for i := range options {
+		if strconv.Itoa(options[i].ID) == value {
+			return &options[i], nil
 		}
-		if strings.Contains(strings.ToLower(option.GPUName), strings.ToLower(value)) {
-			matches = append(matches, option)
+	}
+	// Match levels, strongest first: full name, short name ("RTX 3090"),
+	// whole-word suffix ("3090" is RTX 3090, not RTX 3090 Ti), substring.
+	lower := strings.ToLower(value)
+	var exact, short, suffix, partial []api.ServerlessGPUTypeOption
+	for _, option := range options {
+		name := strings.ToLower(option.GPUName)
+		switch {
+		case name == lower:
+			exact = append(exact, option)
+		case strings.ToLower(shortGPUName(option.GPUName)) == lower:
+			short = append(short, option)
+		case strings.HasSuffix(name, " "+lower):
+			suffix = append(suffix, option)
+		case strings.Contains(name, lower):
+			partial = append(partial, option)
+		}
+	}
+	var matches []api.ServerlessGPUTypeOption
+	for _, level := range [][]api.ServerlessGPUTypeOption{exact, short, suffix, partial} {
+		if len(level) > 0 {
+			matches = level
+			break
 		}
 	}
 	if len(matches) == 1 {
 		return &matches[0], nil
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("serverless GPU type %q not found", value)
+		return nil, fmt.Errorf("serverless GPU type %q not found (see `gpulab serverless options`)", value)
 	}
-	return nil, fmt.Errorf("serverless GPU type %q is ambiguous", value)
+	choices := make([]string, len(matches))
+	for i, m := range matches {
+		choices[i] = fmt.Sprintf("%d = %s %s (%d free)", m.ID, m.GPUName, formatGPUMemory(m.GPUTotalMemory), m.FreeGPUsCount)
+	}
+	return nil, fmt.Errorf("serverless GPU type %q is ambiguous; use an ID:\n  %s", value, strings.Join(choices, "\n  "))
+}
+
+// resolveServerlessGPUTypeList builds the ordered GPU type list for a write.
+// set (from --gpu-type) replaces the current list; add appends fallbacks;
+// remove drops entries. The result keeps order and has no duplicates.
+func resolveServerlessGPUTypeList(options []api.ServerlessGPUTypeOption, current []int, set, add, remove []string) ([]int, error) {
+	resolveAll := func(values []string) ([]int, error) {
+		var ids []int
+		for _, v := range values {
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+			option, err := resolveServerlessGPUTypeOption(options, v)
+			if err != nil {
+				return nil, err
+			}
+			ids = append(ids, option.ID)
+		}
+		return ids, nil
+	}
+
+	list := append([]int(nil), current...)
+	if len(set) > 0 {
+		ids, err := resolveAll(set)
+		if err != nil {
+			return nil, err
+		}
+		list = ids
+	}
+	addIDs, err := resolveAll(add)
+	if err != nil {
+		return nil, err
+	}
+	list = append(list, addIDs...)
+
+	removeIDs, err := resolveAll(remove)
+	if err != nil {
+		return nil, err
+	}
+	drop := map[int]bool{}
+	for _, id := range removeIDs {
+		drop[id] = true
+	}
+
+	seen := map[int]bool{}
+	var out []int
+	for _, id := range list {
+		if drop[id] || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("an endpoint needs at least one GPU type")
+	}
+	if len(out) > maxServerlessGPUTypes {
+		return nil, fmt.Errorf("an endpoint can list at most %d GPU types (got %d)", maxServerlessGPUTypes, len(out))
+	}
+	return out, nil
+}
+
+const maxServerlessGPUTypes = 5
+
+// printServerlessWriteNotes shows the GPU order that was saved, server
+// warnings (e.g. mixed VRAM), and catches an older backend that silently
+// kept only the first GPU type.
+func printServerlessWriteNotes(req *api.ServerlessServiceRequest, resp *api.ServerlessWriteResponse) {
+	if len(req.GPUTypeIDs) > 0 {
+		fmt.Printf("GPU types:    %s\n", serverlessGPUSummary(resp.Data))
+		if len(req.GPUTypeIDs) > 1 && !resp.Data.SupportsGPUTypeList() {
+			fmt.Println(output.Warn("Warning: the backend saved only the first GPU type; it does not support GPU type lists yet."))
+		}
+	}
+	for _, warning := range resp.Warnings {
+		fmt.Println(output.Warn("Warning: " + warning))
+	}
+}
+
+// serverlessGPUSummary renders the GPU type list in preference order, e.g.
+// "RTX 4090 24GB → RTX 3090 24GB". Falls back to the single type name.
+func serverlessGPUSummary(service api.ServerlessService) string {
+	if len(service.GPUTypes) == 0 {
+		return shortGPUName(service.GPUTypeName)
+	}
+	parts := make([]string, len(service.GPUTypes))
+	for i, t := range service.GPUTypes {
+		parts[i] = strings.TrimSpace(shortGPUName(t.Name) + " " + formatGPUMemory(t.VRAMMB))
+	}
+	return strings.Join(parts, " → ")
+}
+
+func shortGPUName(name string) string {
+	name = strings.TrimSpace(name)
+	for _, prefix := range []string{"NVIDIA GeForce ", "NVIDIA "} {
+		if strings.HasPrefix(name, prefix) {
+			return strings.TrimPrefix(name, prefix)
+		}
+	}
+	return name
+}
+
+func formatGPUMemory(mb int) string {
+	if mb <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%dGB", (mb+512)/1024)
 }
 
 func resolveServerlessRegionOption(options []api.ServerlessRegionOption, value string) (*api.ServerlessRegionOption, error) {
@@ -1101,10 +1258,12 @@ func serverlessRequestFromService(service api.ServerlessService) (*api.Serverles
 			"updating from it would erase the autoscaling policy", service.Name)
 	}
 	req := &api.ServerlessServiceRequest{
-		Name:                     service.Name,
-		IsEnabled:                service.IsEnabled,
-		TemplateID:               service.TemplateID,
-		GPUTypeID:                service.GPUTypeID,
+		Name:       service.Name,
+		IsEnabled:  service.IsEnabled,
+		TemplateID: service.TemplateID,
+		GPUTypeID:  service.GPUTypeID,
+		// GPUTypeIDs is left empty: the backend keeps the current list when
+		// only the (unchanged) preferred gpu_type_id comes back.
 		RegionID:                 service.RegionID,
 		GPUCount:                 service.GPUCount,
 		Memory:                   service.Memory,
@@ -1284,7 +1443,7 @@ func printServerlessServices(services []api.ServerlessService) {
 				shortID(service.UUID),
 				service.Name,
 				output.StatusColor(status),
-				service.GPUTypeName,
+				serverlessGPUSummary(service),
 				volume,
 				fmt.Sprintf("%d/%d", service.ActiveReplicasCount, service.MaxReplicas),
 				scalingCell(service),
@@ -1314,7 +1473,26 @@ func printServerlessDetail(detail *api.ServerlessDetail) {
 	}
 
 	fmt.Printf("\nResources:\n")
-	fmt.Printf("  GPU:         %s x%d\n", service.GPUTypeName, service.GPUCount)
+	if len(service.GPUTypes) > 1 {
+		fmt.Printf("  GPU:         x%d per replica, first free type wins:\n", service.GPUCount)
+		for i, t := range service.GPUTypes {
+			role := "fallback"
+			if i == 0 {
+				role = "preferred"
+			}
+			free := ""
+			if t.FreeGPUs != nil {
+				free = fmt.Sprintf(", %d free", *t.FreeGPUs)
+			}
+			price := ""
+			if value, ok := t.HourlyPrice.Float64(); ok {
+				price = fmt.Sprintf(", $%.2f/h", value)
+			}
+			fmt.Printf("    %d. %s %s (id %d%s%s) %s\n", i+1, shortGPUName(t.Name), formatGPUMemory(t.VRAMMB), t.ID, price, free, output.Dim(role))
+		}
+	} else {
+		fmt.Printf("  GPU:         %s x%d\n", serverlessGPUSummary(service), service.GPUCount)
+	}
 	fmt.Printf("  Memory:      %d GB\n", service.Memory)
 	fmt.Printf("  Port:        %d\n", service.EndpointPort)
 	fmt.Printf("  Health:      %s\n", service.HealthCheckPath)
@@ -1483,6 +1661,10 @@ func enrichReplica(r api.ServerlessReplica) map[string]interface{} {
 		"uptime":     r.Uptime,
 		"age":        "-",
 	}
+	if r.GPUTypeID != nil {
+		m["gpu_type_id"] = *r.GPUTypeID
+		m["gpu_type_name"] = r.GPUTypeName
+	}
 
 	if t, ok := output.ParseTimestamp(r.CreatedAt); ok {
 		age := time.Since(t)
@@ -1529,7 +1711,7 @@ func printServerlessReplicas(replicas []api.ServerlessReplica, stale map[string]
 		fmt.Println("No replicas found.")
 		return
 	}
-	headers := []string{"UUID", "NAME", "STATUS", "SERVER", "AGE", "CREATED"}
+	headers := []string{"UUID", "NAME", "STATUS", "SERVER", "GPU", "AGE", "CREATED"}
 	if stale != nil {
 		headers = append(headers, "CODE")
 	}
@@ -1544,6 +1726,7 @@ func printServerlessReplicas(replicas []api.ServerlessReplica, stale map[string]
 			replica.ServerName,
 			output.StatusColor(replica.Status),
 			server,
+			firstNonEmpty(shortGPUName(replica.GPUTypeName), "-"),
 			output.Age(replica.CreatedAt),
 			shortTime(replica.CreatedAt),
 		}

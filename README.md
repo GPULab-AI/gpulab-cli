@@ -126,7 +126,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 gpulab deploy \
   --name training-run \
   --template pytorch \
-  --gpu-type "RTX 4090" \
+  --gpu-type 1,3 \
   --memory 32 \
   --ports "8080,6006" \
   --env-file .env \
@@ -149,7 +149,7 @@ gpulab serverless options
 gpulab serverless create \
   --name llama-api \
   --template pytorch \
-  --gpu-type "RTX 4090" \
+  --gpu-type 1,3 \
   --memory 32 \
   --port 8000 \
   --min-replicas 0 \
@@ -169,6 +169,46 @@ gpulab serverless logs llama-api --deploy
 # Update or delete
 gpulab serverless update llama-api --max-replicas 4 --autoscaling-template pending_requests_linear
 gpulab serverless delete llama-api --force
+```
+
+### Multiple GPU types (fallbacks)
+
+An endpoint can list up to 5 GPU types in preference order. A new replica goes
+on the **first type that has a free GPU**; a replica never mixes types. When load
+drops, replicas on fallback types are scaled down first, so the endpoint drifts
+back to its preferred GPU. Each replica bills at the price of the GPU it runs on.
+
+```bash
+# Look up IDs: names repeat with different VRAM (e.g. two "RTX 4090" rows)
+gpulab serverless options
+
+# Preferred RTX 4090 24GB (id 1), fall back to RTX 3090 (id 3)
+gpulab serverless update llama-api --gpu-type 1,3
+
+# Edit the list without retyping it
+gpulab serverless update llama-api --add-gpu-type "3090 Ti"
+gpulab serverless update llama-api --remove-gpu-type 3
+
+# See the order and which GPU each replica landed on
+gpulab serverless inspect llama-api
+gpulab serverless replicas llama-api          # GPU column per replica
+```
+
+- Names resolve as: ID → full name → short name (`RTX 3090`) → whole-word
+  suffix (`3090` is the 3090, not the 3090 Ti) → unique substring. An
+  ambiguous name fails and lists the IDs to choose from.
+- **Test the image on every listed GPU first.** Some kernels need a newer
+  architecture (for example FP8 needs Ada/sm_89; the RTX 3090 is sm_86). Each
+  replica gets `GPULAB_GPU_TYPE_ID`, `GPULAB_GPU_NAME` and `GPULAB_GPU_VRAM_MB`
+  so the worker can pick a code path per GPU.
+- Running replicas keep their GPU when you change the list; new replicas follow
+  the new order.
+- `--json` output includes `gpu_types` (ordered) and per-replica `gpu_type_id` /
+  `gpu_type_name`.
+
+```bash
+# Only failed requests (or: in_flight, errors, completed, timed_out, ...)
+gpulab serverless requests llama-api --status errors
 ```
 
 ### Deploying code & debugging

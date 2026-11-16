@@ -9,69 +9,107 @@ import (
 )
 
 type ServerlessService struct {
-	ID                         int       `json:"id"`
-	UUID                       string    `json:"uuid"`
-	Name                       string    `json:"name"`
-	EndpointKey                string    `json:"endpoint_key"`
-	EndpointURL                string    `json:"endpoint_url"`
-	IsEnabled                  bool      `json:"is_enabled"`
-	TemplateID                 int       `json:"template_id"`
-	TemplateUUID               string    `json:"template_uuid"`
-	TemplateName               string    `json:"template_name"`
-	GPUTypeID                  int       `json:"gpu_type_id"`
-	GPUTypeName                string    `json:"gpu_type_name"`
-	RegionID                   string    `json:"region_id"`
-	RegionName                 string    `json:"region_name"`
-	RegionSlug                 string    `json:"region_slug"`
-	NetworkVolumeID            *int      `json:"network_volume_id"`
-	NetworkVolumeUUID          string    `json:"network_volume_uuid"`
-	NetworkVolumeName          string    `json:"network_volume_name"`
-	NetworkVolumeMaxSize       *int      `json:"network_volume_max_size"`
-	TemplateVolumeMountPath    OptString `json:"template_volume_mount_path"`
-	GPUCount                   int       `json:"gpu_count"`
-	Memory                     int       `json:"memory"`
-	EndpointPort               int       `json:"endpoint_port"`
-	HealthCheckPath            string    `json:"health_check_path"`
-	MinReplicas                int       `json:"min_replicas"`
-	MaxReplicas                int       `json:"max_replicas"`
-	MaxConcurrentRequests      int       `json:"max_concurrent_requests"`
-	AllowOverflowRequests      bool      `json:"allow_overflow_requests"`
-	AutoscalingEnabled         bool      `json:"autoscaling_enabled"`
-	AutoscalingTemplateKey     OptString `json:"autoscaling_template_key"`
-	AutoscalingPolicyCode      OptString `json:"autoscaling_policy_code"`
-	AutoscalingMetricsConfig   OptString `json:"autoscaling_metrics_config"`
-	AutoscalingLastEvaluatedAt OptString `json:"autoscaling_last_evaluated_at"`
-	AutoscalingLastErrorAt     OptString `json:"autoscaling_last_error_at"`
-	IdleTimeoutSeconds         int       `json:"idle_timeout_seconds"`
-	ColdStartTimeoutSeconds    int       `json:"cold_start_timeout_seconds"`
-	RequestTimeoutSeconds      int       `json:"request_timeout_seconds"`
-	ImagePullPolicy            string    `json:"image_pull_policy"`
-	CUDAVersion                OptString `json:"cuda_version"`
-	Command                    OptString `json:"command"`
-	EnvironmentVariables       OptString `json:"environment_variables"`
-	EnvironmentVariablesMap    JSONMap   `json:"environment_variables_map"`
-	Notes                      OptString `json:"notes"`
-	LastInvokedAt              string    `json:"last_invoked_at"`
-	LastScaledAt               string    `json:"last_scaled_at"`
-	CreatedAt                  string    `json:"created_at"`
-	UpdatedAt                  string    `json:"updated_at"`
-	ActiveReplicasCount        int       `json:"active_replicas_count"`
-	ProvisioningReplicasCount  int       `json:"provisioning_replicas_count"`
-	TotalRequestsCount         int       `json:"total_requests_count"`
-	QueuedRequestsCount        int       `json:"queued_requests_count"`
+	ID           int    `json:"id"`
+	UUID         string `json:"uuid"`
+	Name         string `json:"name"`
+	EndpointKey  string `json:"endpoint_key"`
+	EndpointURL  string `json:"endpoint_url"`
+	IsEnabled    bool   `json:"is_enabled"`
+	TemplateID   int    `json:"template_id"`
+	TemplateUUID string `json:"template_uuid"`
+	TemplateName string `json:"template_name"`
+	GPUTypeID    int    `json:"gpu_type_id"`
+	GPUTypeName  string `json:"gpu_type_name"`
+	// GPUTypes is the ordered list (preferred first). Older backends do not
+	// send it; use ServiceGPUTypeIDs() to read the list either way.
+	GPUTypes                   []ServerlessServiceGPUType `json:"gpu_types,omitempty"`
+	RegionID                   string                     `json:"region_id"`
+	RegionName                 string                     `json:"region_name"`
+	RegionSlug                 string                     `json:"region_slug"`
+	NetworkVolumeID            *int                       `json:"network_volume_id"`
+	NetworkVolumeUUID          string                     `json:"network_volume_uuid"`
+	NetworkVolumeName          string                     `json:"network_volume_name"`
+	NetworkVolumeMaxSize       *int                       `json:"network_volume_max_size"`
+	TemplateVolumeMountPath    OptString                  `json:"template_volume_mount_path"`
+	GPUCount                   int                        `json:"gpu_count"`
+	Memory                     int                        `json:"memory"`
+	EndpointPort               int                        `json:"endpoint_port"`
+	HealthCheckPath            string                     `json:"health_check_path"`
+	MinReplicas                int                        `json:"min_replicas"`
+	MaxReplicas                int                        `json:"max_replicas"`
+	MaxConcurrentRequests      int                        `json:"max_concurrent_requests"`
+	AllowOverflowRequests      bool                       `json:"allow_overflow_requests"`
+	AutoscalingEnabled         bool                       `json:"autoscaling_enabled"`
+	AutoscalingTemplateKey     OptString                  `json:"autoscaling_template_key"`
+	AutoscalingPolicyCode      OptString                  `json:"autoscaling_policy_code"`
+	AutoscalingMetricsConfig   OptString                  `json:"autoscaling_metrics_config"`
+	AutoscalingLastEvaluatedAt OptString                  `json:"autoscaling_last_evaluated_at"`
+	AutoscalingLastErrorAt     OptString                  `json:"autoscaling_last_error_at"`
+	IdleTimeoutSeconds         int                        `json:"idle_timeout_seconds"`
+	ColdStartTimeoutSeconds    int                        `json:"cold_start_timeout_seconds"`
+	RequestTimeoutSeconds      int                        `json:"request_timeout_seconds"`
+	ImagePullPolicy            string                     `json:"image_pull_policy"`
+	CUDAVersion                OptString                  `json:"cuda_version"`
+	Command                    OptString                  `json:"command"`
+	EnvironmentVariables       OptString                  `json:"environment_variables"`
+	EnvironmentVariablesMap    JSONMap                    `json:"environment_variables_map"`
+	Notes                      OptString                  `json:"notes"`
+	LastInvokedAt              string                     `json:"last_invoked_at"`
+	LastScaledAt               string                     `json:"last_scaled_at"`
+	CreatedAt                  string                     `json:"created_at"`
+	UpdatedAt                  string                     `json:"updated_at"`
+	ActiveReplicasCount        int                        `json:"active_replicas_count"`
+	ProvisioningReplicasCount  int                        `json:"provisioning_replicas_count"`
+	TotalRequestsCount         int                        `json:"total_requests_count"`
+	QueuedRequestsCount        int                        `json:"queued_requests_count"`
 }
 
 type ServerlessReplica struct {
-	ID         int               `json:"id"`
-	UUID       string            `json:"uuid"`
-	ServerName string            `json:"server_name"`
-	Status     string            `json:"status"`
-	HasLogs    bool              `json:"has_logs"`
-	Uptime     string            `json:"uptime"`
-	ServerID   *int              `json:"server_id"`
-	Server     map[string]string `json:"server"`
-	CreatedAt  string            `json:"created_at"`
-	UpdatedAt  string            `json:"updated_at"`
+	ID          int               `json:"id"`
+	UUID        string            `json:"uuid"`
+	ServerName  string            `json:"server_name"`
+	Status      string            `json:"status"`
+	HasLogs     bool              `json:"has_logs"`
+	Uptime      string            `json:"uptime"`
+	ServerID    *int              `json:"server_id"`
+	Server      map[string]string `json:"server"`
+	GPUTypeID   *int              `json:"gpu_type_id,omitempty"`
+	GPUTypeName string            `json:"gpu_type_name,omitempty"`
+	CreatedAt   string            `json:"created_at"`
+	UpdatedAt   string            `json:"updated_at"`
+}
+
+// ServerlessServiceGPUType is one entry of an endpoint's ordered GPU type
+// list. A new replica goes on the first entry with a free GPU.
+type ServerlessServiceGPUType struct {
+	ID          int       `json:"id"`
+	Name        string    `json:"name"`
+	VRAMMB      int       `json:"vram_mb,omitempty"`
+	HourlyPrice FlexFloat `json:"hourly_price,omitempty"`
+	Priority    int       `json:"priority"`
+	FreeGPUs    *int      `json:"free_gpus,omitempty"`
+}
+
+// ServiceGPUTypeIDs returns the endpoint's GPU type ids in preference order,
+// falling back to the single gpu_type_id on backends without the list.
+func (s ServerlessService) ServiceGPUTypeIDs() []int {
+	if len(s.GPUTypes) > 0 {
+		ids := make([]int, len(s.GPUTypes))
+		for i, t := range s.GPUTypes {
+			ids[i] = t.ID
+		}
+		return ids
+	}
+	if s.GPUTypeID != 0 {
+		return []int{s.GPUTypeID}
+	}
+	return nil
+}
+
+// SupportsGPUTypeList reports whether the backend that produced this payload
+// understands gpu_type_ids (it always returns gpu_types when it does).
+func (s ServerlessService) SupportsGPUTypeList() bool {
+	return s.GPUTypes != nil
 }
 
 type ServerlessBodyPayload struct {
@@ -208,12 +246,15 @@ type ServerlessOptions struct {
 }
 
 type ServerlessServiceRequest struct {
-	Name                     string      `json:"name"`
-	IsEnabled                bool        `json:"is_enabled"`
-	TemplateID               int         `json:"template_id,omitempty"`
-	Template                 string      `json:"template,omitempty"`
-	GPUTypeID                int         `json:"gpu_type_id,omitempty"`
-	GPUType                  string      `json:"gpu_type,omitempty"`
+	Name       string `json:"name"`
+	IsEnabled  bool   `json:"is_enabled"`
+	TemplateID int    `json:"template_id,omitempty"`
+	Template   string `json:"template,omitempty"`
+	GPUTypeID  int    `json:"gpu_type_id,omitempty"`
+	GPUType    string `json:"gpu_type,omitempty"`
+	// GPUTypeIDs is the ordered GPU type list (preferred first). GPUTypeID is
+	// always sent as GPUTypeIDs[0] so older backends still get a valid type.
+	GPUTypeIDs               []int       `json:"gpu_type_ids,omitempty"`
 	RegionID                 string      `json:"region_id,omitempty"`
 	Region                   string      `json:"region,omitempty"`
 	NetworkVolumeID          *int        `json:"network_volume_id,omitempty"`
@@ -241,9 +282,10 @@ type ServerlessServiceRequest struct {
 }
 
 type ServerlessWriteResponse struct {
-	Status  string            `json:"status"`
-	Message string            `json:"message"`
-	Data    ServerlessService `json:"data"`
+	Status   string            `json:"status"`
+	Message  string            `json:"message"`
+	Data     ServerlessService `json:"data"`
+	Warnings []string          `json:"warnings,omitempty"`
 }
 
 type ServerlessPolicyValidationRequest struct {
@@ -339,8 +381,11 @@ func (c *Client) DeleteServerlessService(identifier string) error {
 	return err
 }
 
-func (c *Client) ListServerlessRequests(identifier string, page, perPage int) (*ServerlessPage[ServerlessRequestLog], error) {
+func (c *Client) ListServerlessRequests(identifier string, page, perPage int, status ...string) (*ServerlessPage[ServerlessRequestLog], error) {
 	params := url.Values{}
+	if len(status) > 0 && strings.TrimSpace(strings.Join(status, "")) != "" {
+		params.Set("status", strings.Join(status, ","))
+	}
 	if page > 0 {
 		params.Set("page", strconv.Itoa(page))
 	}
